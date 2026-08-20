@@ -13,7 +13,7 @@ use log::{debug, info, trace, warn};
 use crate::client::connection::{CompoundOp, Connection};
 use crate::client::stream::{FileDownload, Progress};
 use crate::error::Result;
-use crate::msg::close::CloseRequest;
+use crate::msg::close::{CloseRequest, CloseResponse, SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB};
 use crate::msg::create::{
     CreateDisposition, CreateRequest, CreateResponse, ImpersonationLevel, ShareAccess,
 };
@@ -112,6 +112,66 @@ pub struct DirectoryEntry {
     pub created: FileTime,
     /// The last modification time.
     pub modified: FileTime,
+    /// The last metadata change time.
+    pub change_time: FileTime,
+    /// Raw SMB file-attribute bits.
+    pub file_attributes: u32,
+}
+
+impl DirectoryEntry {
+    /// Metadata captured by directory enumeration for consistency checks.
+    #[must_use]
+    pub fn fingerprint(&self) -> FileFingerprint {
+        FileFingerprint {
+            size: self.size,
+            modified: self.modified,
+            change_time: self.change_time,
+        }
+    }
+}
+
+/// File metadata returned at SMB open/close boundaries.
+///
+/// Comparing a directory entry's [`DirectoryEntry::fingerprint`] with the
+/// fingerprints returned by [`Tree::read_file_compound_sized`] lets callers
+/// detect replacements or writes racing a backup without extra STAT requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileFingerprint {
+    /// End-of-file position in bytes.
+    pub size: u64,
+    /// Last write time.
+    pub modified: FileTime,
+    /// Last metadata change time.
+    pub change_time: FileTime,
+}
+
+impl FileFingerprint {
+    fn from_create(response: &CreateResponse) -> Self {
+        Self {
+            size: response.end_of_file,
+            modified: response.last_write_time,
+            change_time: response.change_time,
+        }
+    }
+
+    fn from_close(response: &CloseResponse) -> Self {
+        Self {
+            size: response.end_of_file,
+            modified: response.last_write_time,
+            change_time: response.change_time,
+        }
+    }
+}
+
+/// Data and boundary metadata from a size-aware compound read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompoundRead {
+    /// Bytes returned by READ (empty for an expected zero-length file).
+    pub data: Vec<u8>,
+    /// Metadata returned by CREATE when the handle was opened.
+    pub opened: FileFingerprint,
+    /// Metadata returned by CLOSE with post-query attributes.
+    pub closed: FileFingerprint,
 }
 
 /// One QUERY_DIRECTORY round trip within a directory listing, captured by
@@ -574,6 +634,213 @@ impl Tree {
 
         trace!("tree: read_file_compound done, read {} bytes", data.len());
         Ok(data)
+    }
+
+    /// Read a listed file using its expected size to budget the compound.
+    ///
+    /// For a non-empty file this sends CREATE+READ+CLOSE in one transport
+    /// frame. `expected_size` determines the READ length and credit charge,
+    /// avoiding a reservation for the full negotiated `MaxReadSize` for every
+    /// small file. For `expected_size == 0` it sends CREATE+CLOSE: SMB2 READ
+    /// has no useful zero-length form and no data is expected.
+    ///
+    /// CLOSE requests post-query attributes. The method returns metadata from
+    /// both CREATE and CLOSE without deciding whether it matches a prior
+    /// directory listing; the caller owns that policy and can report all three
+    /// fingerprints together. A CLOSE failure is fatal and triggers a
+    /// best-effort standalone CLOSE with the FileId returned by CREATE.
+    pub async fn read_file_compound_sized(
+        &self,
+        conn: &Connection,
+        path: &str,
+        expected_size: u64,
+    ) -> Result<CompoundRead> {
+        let normalized = self.format_path(path);
+        let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+        if expected_size > u64::from(max_read) {
+            return Err(Error::FileTooLargeForSingleRead {
+                size: expected_size,
+                max_read,
+            });
+        }
+
+        let create_req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_READ_DATA
+                    | FileAccessMask::FILE_READ_ATTRIBUTES
+                    | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0,
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: FILE_NON_DIRECTORY_FILE,
+            name: normalized.clone(),
+            create_contexts: vec![],
+        };
+        let read_len = expected_size as u32;
+        let read_credit_charge = u16::try_from(u64::from(read_len).div_ceil(65536).max(1))
+            .map_err(|_| {
+                Error::invalid_data(format!(
+                    "READ of {expected_size} bytes requires more than 65535 SMB credits"
+                ))
+            })?;
+        let read_req = ReadRequest {
+            padding: 0x50,
+            flags: 0,
+            length: read_len,
+            offset: 0,
+            file_id: FileId::SENTINEL,
+            minimum_count: 0,
+            channel: SMB2_CHANNEL_NONE,
+            remaining_bytes: 0,
+            read_channel_info: vec![],
+        };
+        let close_req = CloseRequest {
+            flags: SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB,
+            file_id: FileId::SENTINEL,
+        };
+
+        let mut ops = Vec::with_capacity(3);
+        ops.push(CompoundOp {
+            command: Command::Create,
+            body: &create_req,
+            tree_id: Some(self.tree_id),
+            credit_charge: CreditCharge(1),
+        });
+        if expected_size != 0 {
+            ops.push(CompoundOp {
+                command: Command::Read,
+                body: &read_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(read_credit_charge),
+            });
+        }
+        ops.push(CompoundOp {
+            command: Command::Close,
+            body: &close_req,
+            tree_id: Some(self.tree_id),
+            credit_charge: CreditCharge(1),
+        });
+
+        trace!(
+            "tree: read_file_compound_sized path={}, expected_size={}, ops={}, read_credits={}",
+            normalized,
+            expected_size,
+            ops.len(),
+            if expected_size == 0 {
+                0
+            } else {
+                read_credit_charge
+            }
+        );
+
+        let responses = conn.execute_compound(&ops).await?;
+        if responses.len() != ops.len() {
+            return Err(Error::invalid_data(format!(
+                "compound response has {} frames, expected {}",
+                responses.len(),
+                ops.len()
+            )));
+        }
+        let mut responses = responses.into_iter();
+
+        let create_frame = responses
+            .next()
+            .ok_or_else(|| Error::invalid_data("compound response omitted CREATE"))??;
+        if create_frame.header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: create_frame.header.status,
+                command: Command::Create,
+            });
+        }
+        let mut create_cursor = ReadCursor::new(&create_frame.body);
+        let create_response = CreateResponse::unpack(&mut create_cursor)?;
+        let file_id = create_response.file_id;
+        let opened = FileFingerprint::from_create(&create_response);
+
+        let read_frame = if expected_size == 0 {
+            None
+        } else {
+            let read_frame = match responses.next() {
+                Some(Ok(frame)) => frame,
+                Some(Err(error)) => {
+                    let mut cleanup_conn = conn.clone();
+                    let _ = self.close_handle(&mut cleanup_conn, file_id).await;
+                    return Err(error);
+                }
+                None => {
+                    let mut cleanup_conn = conn.clone();
+                    let _ = self.close_handle(&mut cleanup_conn, file_id).await;
+                    return Err(Error::invalid_data("compound response omitted READ"));
+                }
+            };
+            if read_frame.header.status != NtStatus::SUCCESS
+                && read_frame.header.status != NtStatus::END_OF_FILE
+            {
+                let mut cleanup_conn = conn.clone();
+                let _ = self.close_handle(&mut cleanup_conn, file_id).await;
+                return Err(Error::Protocol {
+                    status: read_frame.header.status,
+                    command: Command::Read,
+                });
+            }
+            Some(read_frame)
+        };
+
+        let close_frame = match responses.next() {
+            Some(Ok(frame)) => frame,
+            Some(Err(error)) => {
+                let mut cleanup_conn = conn.clone();
+                let _ = self.close_handle(&mut cleanup_conn, file_id).await;
+                return Err(error);
+            }
+            None => {
+                let mut cleanup_conn = conn.clone();
+                let _ = self.close_handle(&mut cleanup_conn, file_id).await;
+                return Err(Error::invalid_data("compound response omitted CLOSE"));
+            }
+        };
+        if close_frame.header.status != NtStatus::SUCCESS {
+            let status = close_frame.header.status;
+            let mut cleanup_conn = conn.clone();
+            let _ = self.close_handle(&mut cleanup_conn, file_id).await;
+            return Err(Error::Protocol {
+                status,
+                command: Command::Close,
+            });
+        }
+        let mut close_cursor = ReadCursor::new(&close_frame.body);
+        let close_response = CloseResponse::unpack(&mut close_cursor)?;
+        if close_response.flags & SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB == 0 {
+            return Err(Error::invalid_data(format!(
+                "compound CLOSE for {path:?} omitted requested post-query attributes"
+            )));
+        }
+        let closed = FileFingerprint::from_close(&close_response);
+
+        // Parse READ only after a successful CLOSE. This keeps CLOSE fatal even
+        // when the READ body itself is malformed, while guaranteeing the open
+        // handle has already been released before a parse error is returned.
+        let data = match read_frame {
+            None => Vec::new(),
+            Some(frame) if frame.header.status == NtStatus::END_OF_FILE => Vec::new(),
+            Some(frame) => {
+                let mut read_cursor = ReadCursor::new(&frame.body);
+                ReadResponse::unpack(&mut read_cursor)?.data
+            }
+        };
+
+        Ok(CompoundRead {
+            data,
+            opened,
+            closed,
+        })
     }
 
     /// Read a file's contents using a compound request (1 round-trip).
@@ -2084,6 +2351,15 @@ impl Tree {
     /// drop, or by calling the internal close path). Leaking the handle
     /// wastes server resources.
     pub async fn open_file(&self, conn: &mut Connection, path: &str) -> Result<(FileId, u64)> {
+        let (file_id, fingerprint) = self.open_file_with_fingerprint(conn, path).await?;
+        Ok((file_id, fingerprint.size))
+    }
+
+    pub(crate) async fn open_file_with_fingerprint(
+        &self,
+        conn: &Connection,
+        path: &str,
+    ) -> Result<(FileId, FileFingerprint)> {
         let path = self.format_path(path);
         let req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
@@ -2118,7 +2394,7 @@ impl Tree {
 
         let mut cursor = ReadCursor::new(&frame.body);
         let resp = CreateResponse::unpack(&mut cursor)?;
-        Ok((resp.file_id, resp.end_of_file))
+        Ok((resp.file_id, FileFingerprint::from_create(&resp)))
     }
 
     /// Open (or create) a file for writing, returning the file handle.
@@ -3048,6 +3324,41 @@ impl Tree {
         Ok(())
     }
 
+    pub(crate) async fn close_handle_with_fingerprint(
+        &self,
+        conn: &mut Connection,
+        file_id: FileId,
+    ) -> Result<FileFingerprint> {
+        conn.forget_oplock(file_id);
+        let req = CloseRequest {
+            flags: SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB,
+            file_id,
+        };
+        let frame = match conn.execute(Command::Close, &req, Some(self.tree_id)).await {
+            Ok(frame) => frame,
+            Err(error) => {
+                let _ = self.close_handle(conn, file_id).await;
+                return Err(error);
+            }
+        };
+        if frame.header.status != NtStatus::SUCCESS {
+            let status = frame.header.status;
+            let _ = self.close_handle(conn, file_id).await;
+            return Err(Error::Protocol {
+                status,
+                command: Command::Close,
+            });
+        }
+        let mut cursor = ReadCursor::new(&frame.body);
+        let response = CloseResponse::unpack(&mut cursor)?;
+        if response.flags & SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB == 0 {
+            return Err(Error::invalid_data(
+                "CLOSE omitted requested post-query attributes",
+            ));
+        }
+        Ok(FileFingerprint::from_close(&response))
+    }
+
     /// Write data to a file in chunks.
     ///
     /// Kept for potential future use by callers that need per-chunk control
@@ -3160,7 +3471,7 @@ fn parse_file_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
         let creation_time = FileTime::unpack(&mut cursor)?;
         let _last_access_time = FileTime::unpack(&mut cursor)?;
         let last_write_time = FileTime::unpack(&mut cursor)?;
-        let _change_time = FileTime::unpack(&mut cursor)?;
+        let change_time = FileTime::unpack(&mut cursor)?;
         let end_of_file = cursor.read_u64_le()?;
         let _allocation_size = cursor.read_u64_le()?;
         let file_attributes = cursor.read_u32_le()?;
@@ -3187,6 +3498,8 @@ fn parse_file_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
             is_directory,
             created: creation_time,
             modified: last_write_time,
+            change_time,
+            file_attributes,
         });
 
         if next_entry_offset == 0 {
@@ -3203,8 +3516,8 @@ mod tests {
     use super::*;
     use crate::client::connection::pack_message;
     use crate::client::test_helpers::{
-        build_close_response, build_create_error_response, build_create_response,
-        build_tree_connect_response, setup_connection,
+        build_close_error_response, build_close_response, build_create_error_response,
+        build_create_response, build_tree_connect_response, setup_connection,
     };
     use crate::msg::create::{CreateAction, CreateResponse};
     use crate::msg::header::Header;
@@ -3269,6 +3582,44 @@ mod tests {
             data,
         };
 
+        pack_message(&h, &body)
+    }
+
+    fn build_create_fingerprint_response(file_id: FileId, fingerprint: FileFingerprint) -> Vec<u8> {
+        let mut h = Header::new_request(Command::Create);
+        h.flags.set_response();
+        h.credits = 32;
+        let body = CreateResponse {
+            oplock_level: OplockLevel::None,
+            flags: 0,
+            create_action: CreateAction::FileOpened,
+            creation_time: FileTime::ZERO,
+            last_access_time: FileTime::ZERO,
+            last_write_time: fingerprint.modified,
+            change_time: fingerprint.change_time,
+            allocation_size: fingerprint.size,
+            end_of_file: fingerprint.size,
+            file_attributes: 0x20,
+            file_id,
+            create_contexts: vec![],
+        };
+        pack_message(&h, &body)
+    }
+
+    fn build_close_fingerprint_response(fingerprint: FileFingerprint) -> Vec<u8> {
+        let mut h = Header::new_request(Command::Close);
+        h.flags.set_response();
+        h.credits = 32;
+        let body = CloseResponse {
+            flags: SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB,
+            creation_time: FileTime::ZERO,
+            last_access_time: FileTime::ZERO,
+            last_write_time: fingerprint.modified,
+            change_time: fingerprint.change_time,
+            allocation_size: fingerprint.size,
+            end_of_file: fingerprint.size,
+            file_attributes: 0x20,
+        };
         pack_message(&h, &body)
     }
 
@@ -3628,6 +3979,16 @@ mod tests {
         assert_eq!(entries[0].name, "test.txt");
         assert_eq!(entries[0].size, 42);
         assert!(!entries[0].is_directory);
+        assert_eq!(entries[0].change_time, FileTime(133_000_000_000_000_000));
+        assert_eq!(entries[0].file_attributes, 0x20);
+        assert_eq!(
+            entries[0].fingerprint(),
+            FileFingerprint {
+                size: 42,
+                modified: FileTime(133_000_000_000_000_000),
+                change_time: FileTime(133_000_000_000_000_000),
+            }
+        );
     }
 
     #[tokio::test]
@@ -5883,6 +6244,147 @@ mod tests {
         // Verify CLOSE uses sentinel FileId.
         let close_parsed = CloseRequest::unpack(&mut cursor3).unwrap();
         assert_eq!(close_parsed.file_id, FileId::SENTINEL);
+    }
+
+    #[tokio::test]
+    async fn read_file_compound_sized_uses_expected_size_and_returns_wire_fingerprints() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        let mut params = conn.params().unwrap();
+        params.max_read_size = 8 * 1024 * 1024;
+        conn.set_test_params(params);
+
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId {
+            persistent: 0x42,
+            volatile: 0x99,
+        };
+        let opened = FileFingerprint {
+            size: 2048,
+            modified: FileTime(11),
+            change_time: FileTime(12),
+        };
+        let closed = FileFingerprint {
+            size: 3072,
+            modified: FileTime(21),
+            change_time: FileTime(22),
+        };
+        let data = vec![0xA5; 1024];
+        let frame = build_compound_response_frame(&[
+            build_create_fingerprint_response(file_id, opened),
+            build_read_response(NtStatus::SUCCESS, data.clone()),
+            build_close_fingerprint_response(closed),
+        ]);
+        mock.queue_response(frame);
+
+        let result = tree
+            .read_file_compound_sized(&conn, "small.bin", 1024)
+            .await
+            .unwrap();
+        assert_eq!(result.data, data);
+        assert_eq!(result.opened, opened);
+        assert_eq!(result.closed, closed);
+
+        let compound = mock.sent_message(1).unwrap();
+        let mut c1 = ReadCursor::new(&compound);
+        let h1 = Header::unpack(&mut c1).unwrap();
+        assert_eq!(h1.command, Command::Create);
+        assert_eq!(h1.credit_charge, CreditCharge(1));
+
+        let off2 = h1.next_command as usize;
+        let mut c2 = ReadCursor::new(&compound[off2..]);
+        let h2 = Header::unpack(&mut c2).unwrap();
+        assert_eq!(h2.command, Command::Read);
+        assert_eq!(h2.credit_charge, CreditCharge(1));
+        let read = ReadRequest::unpack(&mut c2).unwrap();
+        assert_eq!(read.length, 1024);
+        assert_eq!(read.file_id, FileId::SENTINEL);
+
+        let off3 = off2 + h2.next_command as usize;
+        let mut c3 = ReadCursor::new(&compound[off3..]);
+        let h3 = Header::unpack(&mut c3).unwrap();
+        assert_eq!(h3.command, Command::Close);
+        assert_eq!(h3.credit_charge, CreditCharge(1));
+        let close = CloseRequest::unpack(&mut c3).unwrap();
+        assert_eq!(close.flags, SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB);
+        assert_eq!(close.file_id, FileId::SENTINEL);
+    }
+
+    #[tokio::test]
+    async fn read_file_compound_sized_zero_is_create_close_without_read() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
+        let fingerprint = FileFingerprint {
+            size: 0,
+            modified: FileTime(31),
+            change_time: FileTime(32),
+        };
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_fingerprint_response(file_id, fingerprint),
+            build_close_fingerprint_response(fingerprint),
+        ]));
+
+        let result = tree
+            .read_file_compound_sized(&conn, "empty.bin", 0)
+            .await
+            .unwrap();
+        assert!(result.data.is_empty());
+        assert_eq!(result.opened, fingerprint);
+        assert_eq!(result.closed, fingerprint);
+
+        let compound = mock.sent_message(1).unwrap();
+        let mut c1 = ReadCursor::new(&compound);
+        let h1 = Header::unpack(&mut c1).unwrap();
+        assert_eq!(h1.command, Command::Create);
+        let mut c2 = ReadCursor::new(&compound[h1.next_command as usize..]);
+        let h2 = Header::unpack(&mut c2).unwrap();
+        assert_eq!(h2.command, Command::Close);
+        assert_eq!(h2.next_command, 0);
+    }
+
+    #[tokio::test]
+    async fn read_file_compound_sized_close_error_is_fatal_and_retries_close() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        mock.queue_response(build_tree_connect_response(TreeId(7), ShareType::Disk));
+        let tree = Tree::connect(&mut conn, "share").await.unwrap();
+
+        let file_id = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
+        let fingerprint = FileFingerprint {
+            size: 4,
+            modified: FileTime(41),
+            change_time: FileTime(42),
+        };
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_fingerprint_response(file_id, fingerprint),
+            build_read_response(NtStatus::SUCCESS, vec![1, 2, 3, 4]),
+            build_close_error_response(NtStatus::INSUFFICIENT_RESOURCES),
+        ]));
+        mock.queue_response(build_close_response());
+
+        let result = tree
+            .read_file_compound_sized(&conn, "close-error.bin", 4)
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::Protocol {
+                status: NtStatus::INSUFFICIENT_RESOURCES,
+                command: Command::Close,
+            })
+        ));
+        assert_eq!(mock.sent_count(), 3);
     }
 
     // ── Compound write tests ────────────────────────────────────────

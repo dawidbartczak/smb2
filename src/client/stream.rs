@@ -13,7 +13,7 @@ use std::sync::Arc;
 use log::{debug, trace};
 
 use crate::client::connection::Connection;
-use crate::client::tree::Tree;
+use crate::client::tree::{FileFingerprint, Tree};
 use crate::error::Result;
 use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
 use crate::msg::write::{WriteRequest, WriteResponse};
@@ -336,6 +336,7 @@ pub struct FileReader {
     conn: Connection,
     file_id: FileId,
     file_size: u64,
+    opened_fingerprint: FileFingerprint,
     max_read: u32,
     closed: bool,
 }
@@ -351,17 +352,19 @@ pub struct FileReader {
 /// [`Tree::open_file_reader`] are thin convenience wrappers; reach for them when
 /// you already hold an `&SmbClient` or `&Arc<Tree>` and don't need the explicit
 /// connection clone.
-pub async fn open_file_reader(
-    tree: Arc<Tree>,
-    mut conn: Connection,
-    path: &str,
-) -> Result<FileReader> {
+pub async fn open_file_reader(tree: Arc<Tree>, conn: Connection, path: &str) -> Result<FileReader> {
     trace!("stream: open_file_reader path={}", path);
 
-    let (file_id, file_size) = tree.open_file(&mut conn, path).await?;
+    let (file_id, opened_fingerprint) = tree.open_file_with_fingerprint(&conn, path).await?;
     let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
 
-    Ok(FileReader::new(tree, conn, file_id, file_size, max_read))
+    Ok(FileReader::new(
+        tree,
+        conn,
+        file_id,
+        opened_fingerprint,
+        max_read,
+    ))
 }
 
 impl FileReader {
@@ -373,14 +376,15 @@ impl FileReader {
         tree: Arc<Tree>,
         conn: Connection,
         file_id: FileId,
-        file_size: u64,
+        opened_fingerprint: FileFingerprint,
         max_read: u32,
     ) -> Self {
         Self {
             tree,
             conn,
             file_id,
-            file_size,
+            file_size: opened_fingerprint.size,
+            opened_fingerprint,
             max_read,
             closed: false,
         }
@@ -390,6 +394,12 @@ impl FileReader {
     #[must_use]
     pub fn size(&self) -> u64 {
         self.file_size
+    }
+
+    /// Metadata returned by CREATE when this handle was opened.
+    #[must_use]
+    pub fn opened_fingerprint(&self) -> FileFingerprint {
+        self.opened_fingerprint
     }
 
     /// Read up to `len` bytes starting at `offset`.
@@ -470,6 +480,17 @@ impl FileReader {
     pub async fn close(mut self) -> Result<()> {
         self.closed = true;
         self.tree.close_handle(&mut self.conn, self.file_id).await
+    }
+
+    /// Close the file and return metadata from CLOSE post-query attributes.
+    ///
+    /// Consumes `self` like [`close`](Self::close). A CLOSE transport or
+    /// protocol error is returned after a best-effort plain CLOSE cleanup.
+    pub async fn close_with_fingerprint(mut self) -> Result<FileFingerprint> {
+        self.closed = true;
+        self.tree
+            .close_handle_with_fingerprint(&mut self.conn, self.file_id)
+            .await
     }
 }
 
@@ -1241,14 +1262,19 @@ impl Drop for FileWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::connection::pack_message;
     use crate::client::test_helpers::{
         build_close_error_response, build_close_response, build_create_response,
         build_flush_response, build_read_error_response, build_read_response,
         build_write_error_response, build_write_response, setup_connection,
     };
+    use crate::msg::close::{CloseRequest, CloseResponse, SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB};
+    use crate::msg::create::{CreateAction, CreateResponse};
+    use crate::msg::header::Header;
+    use crate::pack::FileTime;
     use crate::transport::MockTransport;
     use crate::types::status::NtStatus;
-    use crate::types::{FileId, TreeId};
+    use crate::types::{Command, FileId, OplockLevel, TreeId};
     use std::sync::Arc;
 
     fn test_tree() -> Arc<Tree> {
@@ -1266,6 +1292,44 @@ mod tests {
             persistent: 0xAA,
             volatile: 0xBB,
         }
+    }
+
+    fn build_create_fingerprint_response(file_id: FileId, fingerprint: FileFingerprint) -> Vec<u8> {
+        let mut h = Header::new_request(Command::Create);
+        h.flags.set_response();
+        h.credits = 32;
+        let body = CreateResponse {
+            oplock_level: OplockLevel::None,
+            flags: 0,
+            create_action: CreateAction::FileOpened,
+            creation_time: FileTime::ZERO,
+            last_access_time: FileTime::ZERO,
+            last_write_time: fingerprint.modified,
+            change_time: fingerprint.change_time,
+            allocation_size: fingerprint.size,
+            end_of_file: fingerprint.size,
+            file_attributes: 0x20,
+            file_id,
+            create_contexts: vec![],
+        };
+        pack_message(&h, &body)
+    }
+
+    fn build_close_fingerprint_response(fingerprint: FileFingerprint) -> Vec<u8> {
+        let mut h = Header::new_request(Command::Close);
+        h.flags.set_response();
+        h.credits = 32;
+        let body = CloseResponse {
+            flags: SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB,
+            creation_time: FileTime::ZERO,
+            last_access_time: FileTime::ZERO,
+            last_write_time: fingerprint.modified,
+            change_time: fingerprint.change_time,
+            allocation_size: fingerprint.size,
+            end_of_file: fingerprint.size,
+            file_attributes: 0x20,
+        };
+        pack_message(&h, &body)
     }
 
     // ── FileWriter tests ───────────────────────────────────────────────
@@ -1763,6 +1827,69 @@ mod tests {
 
         // CREATE + 3 READ + CLOSE = 5. Exactly one open, exactly one close.
         assert_eq!(mock.sent_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn file_reader_exposes_open_and_close_fingerprints() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+        let opened = FileFingerprint {
+            size: 1000,
+            modified: FileTime(101),
+            change_time: FileTime(102),
+        };
+        let closed = FileFingerprint {
+            size: 1001,
+            modified: FileTime(201),
+            change_time: FileTime(202),
+        };
+        mock.queue_response(build_create_fingerprint_response(file_id, opened));
+        mock.queue_response(build_close_fingerprint_response(closed));
+
+        let conn = setup_connection(&mock);
+        let tree = test_tree();
+        let reader = tree.open_file_reader(conn, "changing.bin").await.unwrap();
+        assert_eq!(reader.size(), opened.size);
+        assert_eq!(reader.opened_fingerprint(), opened);
+        assert_eq!(reader.close_with_fingerprint().await.unwrap(), closed);
+
+        let close_message = mock.sent_message(1).unwrap();
+        let mut cursor = ReadCursor::new(&close_message);
+        let header = Header::unpack(&mut cursor).unwrap();
+        assert_eq!(header.command, Command::Close);
+        let request = CloseRequest::unpack(&mut cursor).unwrap();
+        assert_eq!(request.flags, SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB);
+        assert_eq!(request.file_id, file_id);
+    }
+
+    #[tokio::test]
+    async fn file_reader_close_with_fingerprint_error_retries_plain_close() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+        let opened = FileFingerprint {
+            size: 10,
+            modified: FileTime(301),
+            change_time: FileTime(302),
+        };
+        mock.queue_response(build_create_fingerprint_response(file_id, opened));
+        mock.queue_response(build_close_error_response(NtStatus::INSUFFICIENT_RESOURCES));
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let tree = test_tree();
+        let reader = tree
+            .open_file_reader(conn, "close-error.bin")
+            .await
+            .unwrap();
+        let result = reader.close_with_fingerprint().await;
+        assert!(matches!(
+            result,
+            Err(Error::Protocol {
+                status: NtStatus::INSUFFICIENT_RESOURCES,
+                command: Command::Close,
+            })
+        ));
+        assert_eq!(mock.sent_count(), 3);
     }
 
     #[tokio::test]

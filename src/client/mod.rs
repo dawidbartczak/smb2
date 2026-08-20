@@ -37,7 +37,9 @@ pub use pipeline::{Op, OpResult, Pipeline};
 pub use session::Session;
 pub use shares::list_shares;
 pub use stream::{FileDownload, FileUpload, FileWriter, Progress};
-pub use tree::{DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, Tree};
+pub use tree::{
+    CompoundRead, DirectoryEntry, FileFingerprint, FileInfo, FsInfo, ListingTrace, QueryStep, Tree,
+};
 pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 
 // Re-export high-level client types.
@@ -750,6 +752,38 @@ impl SmbClient {
                 self.recover_tree(tree).await?;
                 let conn = self.connection_for_tree(tree);
                 tree.read_file_compound(conn, path).await
+            }
+            other => other,
+        }
+    }
+
+    /// Read a listed file with a size-aware compound request.
+    ///
+    /// The READ length and credit charge come from `expected_size`; CREATE and
+    /// CLOSE metadata are returned to the caller for consistency checks.
+    pub async fn read_file_compound_sized(
+        &mut self,
+        tree: &mut Tree,
+        path: &str,
+        expected_size: u64,
+    ) -> Result<CompoundRead> {
+        let result = {
+            let conn = self.connection_for_tree(tree);
+            tree.read_file_compound_sized(conn, path, expected_size)
+                .await
+        };
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let new_path = self.handle_dfs_redirect(tree, path).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.read_file_compound_sized(conn, &new_path, expected_size)
+                    .await
+            }
+            Err(e) if self.session_is_gone(&e) => {
+                self.recover_tree(tree).await?;
+                let conn = self.connection_for_tree(tree);
+                tree.read_file_compound_sized(conn, path, expected_size)
+                    .await
             }
             other => other,
         }

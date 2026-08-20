@@ -137,6 +137,13 @@ Table, rationale, and the empirical evidence: `src/name.rs` module docs. What ma
 `Connection::execute_compound(&[CompoundOp])` packs multiple operations into a single transport frame. Each sub-request is 8-byte aligned, linked via `NextCommand`. Subsequent related operations use `FileId::SENTINEL` (the server substitutes the real handle from the first CREATE).
 
 - **Read compound**: CREATE + READ + CLOSE (3 ops, 1 round-trip). Default for `read_file`.
+- **Size-aware read compound**: `read_file_compound_sized` uses the listed
+  size for READ length and credit charge, returns CREATE/CLOSE fingerprints,
+  and uses CLOSE post-query attributes. A zero-size expectation is
+  CREATE+CLOSE with no READ. The caller compares listing/open/close metadata;
+  the library deliberately returns all three observations instead of hiding a
+  mismatch behind a generic error. Connection clones may overlap these calls;
+  MessageId allocation and credit admission remain connection-owned.
 - **Write compound**: CREATE + WRITE + FLUSH + CLOSE (4 ops, 1 round-trip). Default for `write_file`.
 - **Delete compound**: CREATE (DELETE_ON_CLOSE) + CLOSE (2 ops, 1 round-trip). Default for `delete_file` / `delete_directory`.
 - **Rename compound**: CREATE + SET_INFO + CLOSE (3 ops, 1 round-trip). Default for `rename`.
