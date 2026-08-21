@@ -3359,6 +3359,50 @@ impl Tree {
         Ok(FileFingerprint::from_close(&response))
     }
 
+    pub(crate) async fn close_handle_with_fingerprint_bounded(
+        &self,
+        conn: &mut Connection,
+        file_id: FileId,
+        credit_wait: Duration,
+        response_wait: Duration,
+    ) -> Result<FileFingerprint> {
+        conn.forget_oplock(file_id);
+        let req = CloseRequest {
+            flags: SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB,
+            file_id,
+        };
+        let frame = conn
+            .execute_with_deadlines(
+                Command::Close,
+                &req,
+                Some(self.tree_id),
+                CreditCharge(1),
+                credit_wait,
+                response_wait,
+            )
+            .await?;
+
+        if frame.header.status != NtStatus::SUCCESS {
+            let status = frame.header.status;
+            if !conn.is_disconnected() {
+                let _ = self.close_handle(conn, file_id).await;
+            }
+            return Err(Error::Protocol {
+                status,
+                command: Command::Close,
+            });
+        }
+
+        let mut cursor = ReadCursor::new(&frame.body);
+        let response = CloseResponse::unpack(&mut cursor)?;
+        if response.flags & SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB == 0 {
+            return Err(Error::invalid_data(
+                "CLOSE omitted requested post-query attributes",
+            ));
+        }
+        Ok(FileFingerprint::from_close(&response))
+    }
+
     /// Write data to a file in chunks.
     ///
     /// Kept for potential future use by callers that need per-chunk control

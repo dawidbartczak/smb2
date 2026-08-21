@@ -700,7 +700,7 @@ fn warn_on_stale_waiters(inner: &Inner) {
     }
 }
 
-use crate::client::credits::{CreditPool, CreditReservation};
+use crate::client::credits::{CreditClass, CreditPool, CreditReservation};
 use crate::crypto::compression::{compress_message, decompress_message, CompressedMessage};
 use crate::crypto::encryption::{self, Cipher, NonceGenerator};
 use crate::crypto::kdf::PreauthHasher;
@@ -1308,8 +1308,24 @@ impl Inner {
         charge: u16,
         command: Command,
     ) -> Result<CreditReservation<'_>> {
-        if self.credits.try_reserve(charge) {
-            return Ok(CreditReservation::new(&self.credits, charge));
+        let class = if command == Command::Close {
+            CreditClass::Control
+        } else {
+            CreditClass::Data
+        };
+        self.reserve_credits_with_timeout(charge, command, class, None)
+            .await
+    }
+
+    async fn reserve_credits_with_timeout(
+        &self,
+        charge: u16,
+        command: Command,
+        class: CreditClass,
+        timeout: Option<Duration>,
+    ) -> Result<CreditReservation<'_>> {
+        if let Some(generation) = self.credits.try_reserve(charge, class) {
+            return Ok(CreditReservation::new(&self.credits, charge, generation));
         }
         if self.credits.is_closed() || self.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
@@ -1329,8 +1345,8 @@ impl Inner {
         );
 
         let started = std::time::Instant::now();
-        let deadline = started + self.credits.wait_timeout();
-        let mut reserving = Box::pin(self.credits.reserve(charge));
+        let deadline = started + timeout.unwrap_or_else(|| self.credits.wait_timeout());
+        let mut reserving = Box::pin(self.credits.reserve(charge, class));
         loop {
             // `select` polls the reservation first, so credits that land in
             // the same tick as a recheck are taken rather than declared lost.
@@ -1338,14 +1354,14 @@ impl Inner {
             match select(reserving, recheck).await {
                 Either::Left((res, _)) => {
                     return match res {
-                        Ok(()) => {
+                        Ok(generation) => {
                             debug!(
                                 "credits: {:?} acquired {} credit(s) after {:?}",
                                 command,
                                 charge,
                                 started.elapsed()
                             );
-                            Ok(CreditReservation::new(&self.credits, charge))
+                            Ok(CreditReservation::new(&self.credits, charge, generation))
                         }
                         // The pool only closes on connection teardown.
                         Err(_) => Err(Error::Disconnected),
@@ -2269,12 +2285,55 @@ impl Connection {
         result
     }
 
+    /// Execute one standalone request with separate bounds for waiting on its
+    /// credit and for waiting on its response after the transport accepts it.
+    pub(crate) async fn execute_with_deadlines(
+        &self,
+        command: Command,
+        body: &dyn Pack,
+        tree_id: Option<TreeId>,
+        credit_charge: CreditCharge,
+        credit_wait: Duration,
+        response_wait: Duration,
+    ) -> Result<Frame> {
+        let result = self
+            .execute_with_credits_inner_bounded(
+                command,
+                body,
+                tree_id,
+                credit_charge,
+                Some(credit_wait),
+                Some(response_wait),
+            )
+            .await;
+        if result.is_err() {
+            self.inner
+                .metrics
+                .requests_returned_err
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
     async fn execute_with_credits_inner(
         &self,
         command: Command,
         body: &dyn Pack,
         tree_id: Option<TreeId>,
         credit_charge: CreditCharge,
+    ) -> Result<Frame> {
+        self.execute_with_credits_inner_bounded(command, body, tree_id, credit_charge, None, None)
+            .await
+    }
+
+    async fn execute_with_credits_inner_bounded(
+        &self,
+        command: Command,
+        body: &dyn Pack,
+        tree_id: Option<TreeId>,
+        credit_charge: CreditCharge,
+        credit_wait: Option<Duration>,
+        response_wait: Option<Duration>,
     ) -> Result<Frame> {
         if self.inner.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
@@ -2284,7 +2343,15 @@ impl Connection {
         // together (MS-SMB2 § 3.2.4.1.6 consumes `CreditCharge` sequence
         // numbers per request), and a reservation that has to wait must not
         // leave a hole in the sequence window meanwhile.
-        let reservation = self.inner.reserve_credits(charge, command).await?;
+        let class = if command == Command::Close {
+            CreditClass::Control
+        } else {
+            CreditClass::Data
+        };
+        let reservation = self
+            .inner
+            .reserve_credits_with_timeout(charge, command, class, credit_wait)
+            .await?;
         let msg_id = self.allocate_msg_id(charge as u64);
 
         let mut header = Header::new_request(command);
@@ -2349,7 +2416,9 @@ impl Connection {
                                 command, msg_id.0, charge, tree_id, should_sign,
                                 msg_bytes.len(), framed.len()
                             );
-                            return self.await_response(guard, command).await;
+                            return self
+                                .await_response_with_timeout(guard, command, response_wait)
+                                .await;
                         }
                         Err(e) => {
                             self.remove_waiter(msg_id);
@@ -2372,7 +2441,8 @@ impl Connection {
             "execute: cmd={:?}, msg_id={}, credit_charge={}, tree_id={:?}, signed={}, encrypted={}, len={}",
             command, msg_id.0, charge, tree_id, should_sign, should_encrypt, wire_bytes.len()
         );
-        self.await_response(guard, command).await
+        self.await_response_with_timeout(guard, command, response_wait)
+            .await
     }
 
     /// Send a request and return its response receiver without awaiting it.
@@ -2545,7 +2615,7 @@ impl Connection {
         if self.inner.disconnected.load(Ordering::Acquire) {
             return ProbeOutcome::Broken;
         }
-        if !self.inner.credits.try_reserve(1) {
+        let Some(generation) = self.inner.credits.try_reserve(1, CreditClass::Data) else {
             self.inner
                 .metrics
                 .keepalive_probes_skipped
@@ -2555,8 +2625,8 @@ impl Connection {
                  liveness signal until a grant comes back"
             );
             return ProbeOutcome::Skipped;
-        }
-        let reservation = CreditReservation::new(&self.inner.credits, 1);
+        };
+        let reservation = CreditReservation::new(&self.inner.credits, 1, generation);
         // No `tree_id`: ECHO is connection-scoped and needs no share. It does
         // carry the session id and gets signed like anything else, because a
         // session that requires signing rejects what isn't signed.
@@ -2681,7 +2751,7 @@ impl Connection {
             .fold(0u16, |acc, c| acc.saturating_add(c));
         let reservation = self
             .inner
-            .reserve_credits(total_charge, ops[0].command)
+            .reserve_credits_with_timeout(total_charge, ops[0].command, CreditClass::Data, None)
             .await?;
 
         let session_id = self.session_id();
@@ -3042,11 +3112,24 @@ impl Connection {
     /// anything the plain deadline was not already losing.
     pub(crate) async fn await_response(
         &self,
-        mut guard: WaiterGuard,
+        guard: WaiterGuard,
         command: Command,
     ) -> Result<Frame> {
+        self.await_response_with_timeout(guard, command, None).await
+    }
+
+    /// Await a response with an optional per-request deadline. Unlike the
+    /// connection-wide policy, an override is exact and is not extended by
+    /// keepalive activity on unrelated requests.
+    async fn await_response_with_timeout(
+        &self,
+        mut guard: WaiterGuard,
+        command: Command,
+        timeout_override: Option<Duration>,
+    ) -> Result<Frame> {
         let msg_id = guard.msg_id();
-        let timeout = *self.inner.response_timeout.lock().unwrap();
+        let exact_deadline = timeout_override.is_some();
+        let timeout = timeout_override.or(*self.inner.response_timeout.lock().unwrap());
         let Some(timeout) = timeout else {
             return guard.recv().await;
         };
@@ -3070,7 +3153,11 @@ impl Connection {
         // more patience, never for unlimited patience. A server answering ECHO
         // that still has not answered THIS is stalled in a way waiting cannot
         // fix, and reconnecting beats waiting.
-        let alive_ceiling = timeout.saturating_mul(ALIVE_DEADLINE_FACTOR);
+        let alive_ceiling = if exact_deadline {
+            timeout
+        } else {
+            timeout.saturating_mul(ALIVE_DEADLINE_FACTOR)
+        };
 
         // Check often enough that a short timeout is honored promptly, rarely
         // enough that the default costs one wakeup a second per request.
@@ -3094,7 +3181,10 @@ impl Connection {
                         if idle < timeout {
                             continue;
                         }
-                        if idle < alive_ceiling && self.inner.liveness_is_proven() {
+                        if !exact_deadline
+                            && idle < alive_ceiling
+                            && self.inner.liveness_is_proven()
+                        {
                             if !extended {
                                 extended = true;
                                 self.inner

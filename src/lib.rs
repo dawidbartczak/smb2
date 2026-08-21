@@ -77,7 +77,9 @@ pub use name::{decode_name, decode_path, encode_name, encode_path};
 pub use client::{connect, ClientConfig, SmbClient};
 
 // Streaming I/O
-pub use client::stream::{FileDownload, FileReader, FileUpload, FileWriter, Progress};
+pub use client::stream::{
+    CloseDeadlines, FileDownload, FileReader, FileUpload, FileWriter, Progress,
+};
 
 // Server-side copy (FSCTL_SRV_COPYCHUNK): copy byte ranges between two files
 // on the server without the data crossing the wire.

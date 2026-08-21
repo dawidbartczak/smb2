@@ -36,7 +36,7 @@ pub use durable::{DurableHandle, DurableOpen};
 pub use pipeline::{Op, OpResult, Pipeline};
 pub use session::Session;
 pub use shares::list_shares;
-pub use stream::{FileDownload, FileUpload, FileWriter, Progress};
+pub use stream::{CloseDeadlines, FileDownload, FileUpload, FileWriter, Progress};
 pub use tree::{
     CompoundRead, DirectoryEntry, FileFingerprint, FileInfo, FsInfo, ListingTrace, QueryStep, Tree,
 };

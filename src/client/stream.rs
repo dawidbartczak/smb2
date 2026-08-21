@@ -9,6 +9,7 @@
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::time::Duration;
 
 use log::{debug, trace};
 
@@ -25,6 +26,18 @@ use crate::Error;
 /// Maximum number of pipelined write requests in flight.
 /// Matches `MAX_PIPELINE_WINDOW` in `tree.rs`.
 const MAX_PIPELINE_WINDOW: usize = 32;
+
+/// Independent deadlines for a bounded file CLOSE.
+///
+/// `credit_wait` applies before the request is sent. `response_wait` begins
+/// only after the transport confirms that the CLOSE frame was accepted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CloseDeadlines {
+    /// Maximum time to wait for the credit needed to send CLOSE.
+    pub credit_wait: Duration,
+    /// Maximum time to wait for the server's response after CLOSE is sent.
+    pub response_wait: Duration,
+}
 
 /// Progress information for a file transfer.
 #[derive(Debug, Clone, Copy)]
@@ -490,6 +503,29 @@ impl FileReader {
         self.closed = true;
         self.tree
             .close_handle_with_fingerprint(&mut self.conn, self.file_id)
+            .await
+    }
+
+    /// Close the file with independent credit and response deadlines.
+    ///
+    /// A credit deadline expires before anything is sent and returns
+    /// [`Error::CreditStarvation`]. A response deadline starts only after the
+    /// transport accepts the CLOSE frame and returns [`Error::Timeout`] (or
+    /// [`Error::ServerUnresponsive`] when the whole connection is silent).
+    /// Transport loss and either timeout never issue a second CLOSE. A plain
+    /// CLOSE fallback is reserved for a protocol error on a healthy session.
+    pub async fn close_with_fingerprint_bounded(
+        mut self,
+        deadlines: CloseDeadlines,
+    ) -> Result<FileFingerprint> {
+        self.closed = true;
+        self.tree
+            .close_handle_with_fingerprint_bounded(
+                &mut self.conn,
+                self.file_id,
+                deadlines.credit_wait,
+                deadlines.response_wait,
+            )
             .await
     }
 }
@@ -1882,6 +1918,98 @@ mod tests {
             .await
             .unwrap();
         let result = reader.close_with_fingerprint().await;
+        assert!(matches!(
+            result,
+            Err(Error::Protocol {
+                status: NtStatus::INSUFFICIENT_RESOURCES,
+                command: Command::Close,
+            })
+        ));
+        assert_eq!(mock.sent_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn bounded_close_reports_credit_starvation_without_sending_close() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+        mock.queue_response(build_create_response(file_id, 10));
+
+        let conn = setup_connection(&mock);
+        let credit_control = conn.clone();
+        let tree = test_tree();
+        let reader = tree
+            .open_file_reader(conn, "credit-starved-close.bin")
+            .await
+            .unwrap();
+        credit_control.set_credits(0);
+
+        let result = reader
+            .close_with_fingerprint_bounded(CloseDeadlines {
+                credit_wait: Duration::from_millis(20),
+                response_wait: Duration::from_millis(50),
+            })
+            .await;
+
+        assert!(matches!(result, Err(Error::CreditStarvation { .. })));
+        assert_eq!(
+            mock.sent_count(),
+            1,
+            "a credit timeout happens before CLOSE reaches the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_close_response_timeout_does_not_send_a_second_close() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+        mock.queue_response(build_create_response(file_id, 10));
+
+        let conn = setup_connection(&mock);
+        let tree = test_tree();
+        let reader = tree
+            .open_file_reader(conn, "silent-close.bin")
+            .await
+            .unwrap();
+
+        let result = reader
+            .close_with_fingerprint_bounded(CloseDeadlines {
+                credit_wait: Duration::from_millis(20),
+                response_wait: Duration::from_millis(50),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::Timeout | Error::ServerUnresponsive { .. })
+        ));
+        assert_eq!(
+            mock.sent_count(),
+            2,
+            "CREATE and one CLOSE are sent; timeout must not trigger plain CLOSE"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_close_protocol_error_retries_plain_close_on_a_live_connection() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+        mock.queue_response(build_create_response(file_id, 10));
+        mock.queue_response(build_close_error_response(NtStatus::INSUFFICIENT_RESOURCES));
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let tree = test_tree();
+        let reader = tree
+            .open_file_reader(conn, "protocol-close.bin")
+            .await
+            .unwrap();
+        let result = reader
+            .close_with_fingerprint_bounded(CloseDeadlines {
+                credit_wait: Duration::from_millis(20),
+                response_wait: Duration::from_millis(50),
+            })
+            .await;
+
         assert!(matches!(
             result,
             Err(Error::Protocol {
