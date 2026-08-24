@@ -309,7 +309,7 @@ mod tests {
         buf
     }
 
-    /// Build a single FileBothDirectoryInformation entry.
+    /// Build a single FileIdBothDirectoryInformation entry.
     fn build_file_both_dir_info(
         name: &str,
         size: u64,
@@ -335,6 +335,7 @@ mod tests {
         buf.push(0); // ShortNameLength
         buf.push(0); // Reserved
         buf.extend_from_slice(&[0u8; 24]); // ShortName
+        buf.extend_from_slice(&0xfeed_u64.to_le_bytes()); // FileId
         for &u in &name_u16 {
             buf.extend_from_slice(&u.to_le_bytes());
         }

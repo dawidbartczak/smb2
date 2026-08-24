@@ -145,6 +145,10 @@ Table, rationale, and the empirical evidence: `src/name.rs` module docs. What ma
   the library deliberately returns all three observations instead of hiding a
   mismatch behind a generic error. Connection clones may overlap these calls;
   MessageId allocation and credit admission remain connection-owned.
+- Directory enumeration requests `FileIdBothDirectoryInformation`; each
+  `DirectoryEntry` carries the server's stable 64-bit file ID. Consumers may
+  combine it with size, mtime and change time to validate resumable work, but
+  it is never globally unique outside the current share/filesystem.
 - **Write compound**: CREATE + WRITE + FLUSH + CLOSE (4 ops, 1 round-trip). Default for `write_file`.
 - **Delete compound**: CREATE (DELETE_ON_CLOSE) + CLOSE (2 ops, 1 round-trip). Default for `delete_file` / `delete_directory`.
 - **Rename compound**: CREATE + SET_INFO + CLOSE (3 ops, 1 round-trip). Default for `rename`.

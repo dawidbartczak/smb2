@@ -116,6 +116,8 @@ pub struct DirectoryEntry {
     pub change_time: FileTime,
     /// Raw SMB file-attribute bits.
     pub file_attributes: u32,
+    /// Stable server-side identifier scoped to this share/filesystem.
+    pub stable_id: Option<u64>,
 }
 
 impl DirectoryEntry {
@@ -2602,7 +2604,7 @@ impl Tree {
         output_buffer_length: u32,
     ) -> Result<QueryStepOutcome> {
         let req = QueryDirectoryRequest {
-            file_information_class: FileInformationClass::FileBothDirectoryInformation,
+            file_information_class: FileInformationClass::FileIdBothDirectoryInformation,
             flags: QueryDirectoryFlags(if restart {
                 QueryDirectoryFlags::RESTART_SCANS
             } else {
@@ -2642,8 +2644,8 @@ impl Tree {
         let resp = QueryDirectoryResponse::unpack(&mut cursor)?;
         let bytes = resp.output_buffer.len();
 
-        // Parse FileBothDirectoryInformation entries from the output buffer.
-        let entries = parse_file_both_directory_info(&resp.output_buffer)?;
+        // Parse FileIdBothDirectoryInformation entries from the output buffer.
+        let entries = parse_file_id_both_directory_info(&resp.output_buffer)?;
         for e in &entries {
             trace!(
                 "tree: dir_entry name={}, size={}, is_dir={}",
@@ -3479,7 +3481,7 @@ fn normalize_path(path: &str) -> String {
     crate::name::encode_path(path)
 }
 
-/// Parse `FileBothDirectoryInformation` entries from raw bytes.
+/// Parse `FileIdBothDirectoryInformation` entries from raw bytes.
 ///
 /// Each entry has:
 /// - NextEntryOffset (4 bytes)
@@ -3496,13 +3498,14 @@ fn normalize_path(path: &str) -> String {
 /// - ShortNameLength (1 byte)
 /// - Reserved (1 byte)
 /// - ShortName (24 bytes)
+/// - FileId (8 bytes)
 /// - FileName (variable, FileNameLength bytes)
-fn parse_file_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
+fn parse_file_id_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
     let mut entries = Vec::new();
     let mut offset = 0usize;
 
     loop {
-        if offset + 94 > data.len() {
+        if offset + 104 > data.len() {
             // Not enough data for the fixed part.
             break;
         }
@@ -3525,6 +3528,7 @@ fn parse_file_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
         let _reserved = cursor.read_u8()?;
         // ShortName: 24 bytes (fixed, null-padded).
         cursor.skip(24)?;
+        let stable_id = cursor.read_u64_le()?;
         // FileName: FileNameLength bytes in UTF-16LE. A single component, so
         // it decodes with `decode_name`, not `decode_path`: a `\` that comes
         // back here is a character in the name (see `crate::name`).
@@ -3544,6 +3548,7 @@ fn parse_file_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
             modified: last_write_time,
             change_time,
             file_attributes,
+            stable_id: Some(stable_id),
         });
 
         if next_entry_offset == 0 {
@@ -3667,7 +3672,7 @@ mod tests {
         pack_message(&h, &body)
     }
 
-    /// Build a single FileBothDirectoryInformation entry.
+    /// Build a single FileIdBothDirectoryInformation entry.
     fn build_file_both_dir_info(
         name: &str,
         size: u64,
@@ -3711,6 +3716,8 @@ mod tests {
         buf.push(0);
         // ShortName (24 bytes, zero-padded)
         buf.extend_from_slice(&[0u8; 24]);
+        // FileId (8)
+        buf.extend_from_slice(&0xfeed_0000_0000_0001u64.to_le_bytes());
         // FileName (variable)
         for &u in &name_u16 {
             buf.extend_from_slice(&u.to_le_bytes());
@@ -3792,6 +3799,7 @@ mod tests {
         assert_eq!(entries[0].name, "file1.txt");
         assert_eq!(entries[0].size, 1024);
         assert!(!entries[0].is_directory);
+        assert_eq!(entries[0].stable_id, Some(0xfeed_0000_0000_0001));
         assert_eq!(entries[1].name, "subdir");
         assert!(entries[1].is_directory);
     }
@@ -3963,7 +3971,7 @@ mod tests {
     #[tokio::test]
     async fn directory_listings_decode_private_use_area_names() {
         let data = build_file_both_dir_info("a\u{F025}b", 7, false, 0);
-        let entries = parse_file_both_directory_info(&data).unwrap();
+        let entries = parse_file_id_both_directory_info(&data).unwrap();
         assert_eq!(entries[0].name, "a?b");
     }
 
@@ -4018,7 +4026,7 @@ mod tests {
     #[tokio::test]
     async fn parse_file_both_dir_info_single_entry() {
         let data = build_file_both_dir_info("test.txt", 42, false, 0);
-        let entries = parse_file_both_directory_info(&data).unwrap();
+        let entries = parse_file_id_both_directory_info(&data).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "test.txt");
         assert_eq!(entries[0].size, 42);
