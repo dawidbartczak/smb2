@@ -87,10 +87,12 @@ impl<'a> ReadCursor<'a> {
         Ok(slice)
     }
 
-    /// Read `byte_len` bytes of UTF-16LE data and decode to a [`String`].
+    /// Read `byte_len` bytes of UTF-16LE data without decoding the code units.
     ///
+    /// Use this for opaque SMB path tokens: decoding and re-encoding a name
+    /// from a directory listing can change the exact path the server returned.
     /// `byte_len` must be even (each code unit is 2 bytes).
-    pub fn read_utf16_le(&mut self, byte_len: usize) -> Result<String> {
+    pub fn read_utf16_units_le(&mut self, byte_len: usize) -> Result<Vec<u16>> {
         if byte_len % 2 != 0 {
             return Err(Error::invalid_data(format!(
                 "UTF-16LE byte length must be even, got {}",
@@ -98,11 +100,17 @@ impl<'a> ReadCursor<'a> {
             )));
         }
         let raw = self.read_bytes(byte_len)?;
-        let code_units: Vec<u16> = raw
+        Ok(raw
             .chunks_exact(2)
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect();
-        String::from_utf16(&code_units)
+            .collect())
+    }
+
+    /// Read `byte_len` bytes of UTF-16LE data and decode to a [`String`].
+    ///
+    /// `byte_len` must be even (each code unit is 2 bytes).
+    pub fn read_utf16_le(&mut self, byte_len: usize) -> Result<String> {
+        String::from_utf16(&self.read_utf16_units_le(byte_len)?)
             .map_err(|_| Error::invalid_data("invalid UTF-16LE encoding"))
     }
 
@@ -221,7 +229,16 @@ impl WriteCursor {
 
     /// Encode a string as UTF-16LE and write the bytes.
     pub fn write_utf16_le(&mut self, s: &str) {
-        for code_unit in s.encode_utf16() {
+        self.write_utf16_units_le(s.encode_utf16());
+    }
+
+    /// Write already encoded UTF-16 code units as little-endian bytes.
+    ///
+    /// This deliberately performs no Unicode normalization or validation. It
+    /// is the write-side counterpart of [`ReadCursor::read_utf16_units_le`]
+    /// for exact path replay.
+    pub fn write_utf16_units_le(&mut self, units: impl IntoIterator<Item = u16>) {
+        for code_unit in units {
             self.buf.extend_from_slice(&code_unit.to_le_bytes());
         }
     }
@@ -397,6 +414,17 @@ mod tests {
         let data = [0x68, 0x00, 0x65];
         let mut cursor = ReadCursor::new(&data);
         assert!(cursor.read_utf16_le(3).is_err());
+    }
+
+    #[test]
+    fn raw_utf16_units_roundtrip_without_decoding() {
+        let units = [0x0019, 0xF019, 0xD800, 0x0061];
+        let mut writer = WriteCursor::new();
+        writer.write_utf16_units_le(units);
+        let bytes = writer.into_inner();
+        let mut reader = ReadCursor::new(&bytes);
+        assert_eq!(reader.read_utf16_units_le(bytes.len()).unwrap(), units);
+        assert!(ReadCursor::new(&bytes).read_utf16_le(bytes.len()).is_err());
     }
 
     // -- WriteCursor tests --

@@ -1,7 +1,7 @@
 //! Error types for the SMB2 library.
 
 use crate::types::status::NtStatus;
-use crate::types::Command;
+use crate::types::{Command, SessionId};
 use thiserror::Error;
 
 /// Why a durable handle could not be claimed back.
@@ -39,6 +39,71 @@ impl std::fmt::Display for DurableLoss {
             Self::NotDurable => "the handle was never durable",
         };
         f.write_str(s)
+    }
+}
+
+/// Source phase in which an SMB operation failed.
+///
+/// This is deliberately independent of rendered error text so backup callers
+/// can make retry and diagnostic decisions without string matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SmbOperationPhase {
+    /// Enumerating directory contents.
+    List,
+    /// Opening a listed object.
+    Open,
+    /// Reading file data.
+    Read,
+    /// Closing an object after use.
+    Close,
+    /// Reading object metadata.
+    Stat,
+    /// Re-establishing a connection or authenticated session.
+    Reconnect,
+}
+
+/// Stable diagnostic context for one failed SMB source operation.
+///
+/// The original [`Error`] remains the return value. This record captures only
+/// the fields an orchestrator needs to persist and display safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmbOperationError {
+    /// SMB2 command being attempted.
+    pub command: Command,
+    /// High-level source phase.
+    pub phase: SmbOperationPhase,
+    /// Server status when the failure came from an SMB response.
+    pub nt_status: Option<NtStatus>,
+    /// Typed error category for policy and diagnostics.
+    pub kind: ErrorKind,
+    /// Whether retrying after recovery may succeed.
+    pub retryable: bool,
+    /// Session on which the operation was issued.
+    pub session_id: SessionId,
+    /// Connection generation on which the operation was issued.
+    pub connection_generation: u64,
+}
+
+impl SmbOperationError {
+    /// Capture typed context at the operation boundary.
+    #[must_use]
+    pub fn capture(
+        error: &Error,
+        command: Command,
+        phase: SmbOperationPhase,
+        session_id: SessionId,
+        connection_generation: u64,
+    ) -> Self {
+        Self {
+            command,
+            phase,
+            nt_status: error.status(),
+            kind: error.kind(),
+            retryable: error.is_retryable(),
+            session_id,
+            connection_generation,
+        }
     }
 }
 
@@ -293,6 +358,10 @@ impl Error {
                     status: NtStatus::INSUFF_SERVER_RESOURCES,
                     ..
                 }
+                | Error::Protocol {
+                    status: NtStatus::BAD_NETWORK_NAME,
+                    ..
+                }
         )
     }
 
@@ -349,8 +418,13 @@ pub enum ErrorKind {
     SigningRequired,
     /// Permission denied (valid credentials, but no access to this resource).
     AccessDenied,
-    /// The file, directory, or share was not found.
+    /// The file or directory was not found.
     NotFound,
+    /// The requested share is unavailable or no longer connected.
+    ///
+    /// This is intentionally distinct from [`NotFound`](Self::NotFound): a
+    /// backup must never interpret a share-level outage as one missing file.
+    ShareUnavailable,
     /// A file or directory with the given name already exists.
     ///
     /// Returned by `Create` (and operations that wrap it, like `create_directory`)
@@ -499,8 +573,10 @@ fn classify_status(status: NtStatus) -> ErrorKind {
         // Not found
         NtStatus::NO_SUCH_FILE
         | NtStatus::OBJECT_NAME_NOT_FOUND
-        | NtStatus::OBJECT_PATH_NOT_FOUND
-        | NtStatus::BAD_NETWORK_NAME => ErrorKind::NotFound,
+        | NtStatus::OBJECT_PATH_NOT_FOUND => ErrorKind::NotFound,
+
+        // Share-level loss. Never collapse this into a missing path.
+        NtStatus::BAD_NETWORK_NAME => ErrorKind::ShareUnavailable,
 
         // Already exists
         NtStatus::OBJECT_NAME_COLLISION => ErrorKind::AlreadyExists,
@@ -568,7 +644,7 @@ mod tests {
         (NtStatus::NO_SUCH_FILE, ErrorKind::NotFound),
         (NtStatus::OBJECT_NAME_NOT_FOUND, ErrorKind::NotFound),
         (NtStatus::OBJECT_PATH_NOT_FOUND, ErrorKind::NotFound),
-        (NtStatus::BAD_NETWORK_NAME, ErrorKind::NotFound),
+        (NtStatus::BAD_NETWORK_NAME, ErrorKind::ShareUnavailable),
         // Already exists
         (NtStatus::OBJECT_NAME_COLLISION, ErrorKind::AlreadyExists),
         // Unusable name
@@ -687,5 +763,31 @@ mod tests {
             command: Command::Create,
         };
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn bad_network_name_is_a_retryable_share_failure_not_a_missing_file() {
+        let err = Error::Protocol {
+            status: NtStatus::BAD_NETWORK_NAME,
+            command: Command::Create,
+        };
+        assert_eq!(err.kind(), ErrorKind::ShareUnavailable);
+        assert_ne!(err.kind(), ErrorKind::NotFound);
+        assert!(err.is_retryable());
+
+        let diagnostic = SmbOperationError::capture(
+            &err,
+            Command::Create,
+            SmbOperationPhase::Open,
+            SessionId(17),
+            3,
+        );
+        assert_eq!(diagnostic.command, Command::Create);
+        assert_eq!(diagnostic.phase, SmbOperationPhase::Open);
+        assert_eq!(diagnostic.nt_status, Some(NtStatus::BAD_NETWORK_NAME));
+        assert_eq!(diagnostic.kind, ErrorKind::ShareUnavailable);
+        assert!(diagnostic.retryable);
+        assert_eq!(diagnostic.session_id, SessionId(17));
+        assert_eq!(diagnostic.connection_generation, 3);
     }
 }

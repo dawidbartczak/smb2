@@ -68,7 +68,7 @@ pub mod fuzzing;
 // ── Re-exports: the simple-case imports ────────────────────────────────
 
 // Error types
-pub use error::{Error, ErrorKind, Result};
+pub use error::{Error, ErrorKind, Result, SmbOperationError, SmbOperationPhase};
 
 /// Filename mapping for characters SMB2 does not allow on the wire.
 pub use name::{decode_name, decode_path, encode_name, encode_path};
@@ -89,7 +89,8 @@ pub use client::copy::{
 
 // Tree and file types
 pub use client::tree::{
-    CompoundRead, DirectoryEntry, FileFingerprint, FileInfo, FsInfo, ListingTrace, QueryStep, Tree,
+    CompoundRead, DirectoryEntry, FileFingerprint, FileInfo, FsInfo, ListingTrace, QueryStep,
+    ReparseDescriptor, ReparseKind, SmbPathToken, SourceObjectId, Tree,
 };
 
 // Pipeline

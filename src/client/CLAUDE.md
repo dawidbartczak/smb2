@@ -127,8 +127,9 @@ Full rationale in `connection.rs` on `KEEPALIVE_AFTER` and `Connection::echo_pro
 
 Table, rationale, and the empirical evidence: `src/name.rs` module docs. What matters at this layer:
 
-- **`Tree::format_path` is the one outbound encode point**, and every method taking a caller path calls it at its own boundary. ❌ Nothing may hand an already-formatted path to another method: a second pass turns the wire path's `\` separators into U+F026 name characters and prepends the DFS prefix twice. The four `open_*` helpers format their own argument, which is what makes double-encoding unreachable rather than merely avoided.
-- **Decoding has to cover every site a name arrives at, or the two halves disagree** and a listing hands back names that nothing can open. Today: `parse_file_both_directory_info` (`tree.rs`, single components → `decode_name`) and `parse_notify_information` (`watcher.rs`, relative paths → `decode_path`). ❌ Adding an info class that carries a name means adding a decode there too.
+- **`Tree::format_path` is the one outbound encode point for caller-supplied paths**, and every method taking such a path calls it at its own boundary. ❌ Nothing may hand an already-formatted path to another method: a second pass turns the wire path's `\` separators into U+F026 name characters and prepends the DFS prefix twice. The four `open_*` helpers format their own argument, which is what makes double-encoding unreachable rather than merely avoided.
+- **A listed entry is reopened only through `SmbPathToken`.** The Services-for-Macintosh display mapping is intentionally interoperable but not bijective: a literal wire U+0019 and wire U+F019 can decode to the same display string. `DirectoryEntry` therefore keeps three separate values: `name` for display, an injective `archive_name`, and an opaque full-path `reopen_token` carrying the original UTF-16 code units. Token-taking CREATE/stat/reader/compound methods pack those units directly; ❌ never reconstruct a listed source path from `name` or `archive_name`.
+- **Decoding still has to cover every human-facing site a name arrives at.** Today: `parse_file_both_directory_info` (`tree.rs`, single components → `decode_name`) and `parse_notify_information` (`watcher.rs`, relative paths → `decode_path`). Adding an info class that carries a name means adding a display decode there, while source identity remains raw.
 - **What is deliberately NOT mapped**: share names, tree-connect paths, the `srvsvc` pipe name, DFS referral *server* and *share* fields, and the `*` search pattern in QUERY_DIRECTORY. Those aren't file names, and the wildcard is meant to be a wildcard.
 - **`/` is the only separator a caller can write.** A `\` is a name character (U+F026). `Tree::rename`'s target, `SmbClient::upload`, `Tree::download`, and the DFS remaining-path all go through the same codec so one convention holds end to end.
 - **DFS referral paths are encoded too** (`SmbClient::handle_dfs_redirect`), because the lookup and the CREATE that follows have to agree on where a component ends; the remaining path comes back through `decode_path` into caller form.
@@ -146,9 +147,14 @@ Table, rationale, and the empirical evidence: `src/name.rs` module docs. What ma
   mismatch behind a generic error. Connection clones may overlap these calls;
   MessageId allocation and credit admission remain connection-owned.
 - Directory enumeration requests `FileIdBothDirectoryInformation`; each
-  `DirectoryEntry` carries the server's stable 64-bit file ID. Consumers may
-  combine it with size, mtime and change time to validate resumable work, but
-  it is never globally unique outside the current share/filesystem.
+  `DirectoryEntry` carries a non-zero 64-bit file ID when available. It becomes
+  a trustworthy `SourceObjectId` only when paired with a non-zero serial from
+  `Tree::volume_serial`; zero or unscoped IDs are unavailable, never stable.
+- Entries with `FILE_ATTRIBUTE_REPARSE_POINT` are classified by
+  `reparse_descriptor_token` (`FSCTL_GET_REPARSE_POINT`) before use. Symlinks
+  and junctions expose their actual print-name target, non-directory
+  file-like tags remain readable files, and unknown directory tags remain a
+  typed unresolved condition rather than an empty link.
 - **Write compound**: CREATE + WRITE + FLUSH + CLOSE (4 ops, 1 round-trip). Default for `write_file`.
 - **Delete compound**: CREATE (DELETE_ON_CLOSE) + CLOSE (2 ops, 1 round-trip). Default for `delete_file` / `delete_directory`.
 - **Rename compound**: CREATE + SET_INFO + CLOSE (3 ops, 1 round-trip). Default for `rename`.

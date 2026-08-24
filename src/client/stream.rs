@@ -14,7 +14,7 @@ use std::time::Duration;
 use log::{debug, trace};
 
 use crate::client::connection::Connection;
-use crate::client::tree::{FileFingerprint, Tree};
+use crate::client::tree::{FileFingerprint, SmbPathToken, Tree};
 use crate::error::Result;
 use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
 use crate::msg::write::{WriteRequest, WriteResponse};
@@ -368,7 +368,20 @@ pub struct FileReader {
 pub async fn open_file_reader(tree: Arc<Tree>, conn: Connection, path: &str) -> Result<FileReader> {
     trace!("stream: open_file_reader path={}", path);
 
-    let (file_id, opened_fingerprint) = tree.open_file_with_fingerprint(&conn, path).await?;
+    let token = tree.path_token(path);
+    open_file_reader_token(tree, conn, &token).await
+}
+
+/// Open a listed file without translating its filename through a display
+/// string. This is the data-safe path for recursive backup consumers.
+pub async fn open_file_reader_token(
+    tree: Arc<Tree>,
+    conn: Connection,
+    token: &SmbPathToken,
+) -> Result<FileReader> {
+    trace!("stream: open_file_reader token={token:?}");
+
+    let (file_id, opened_fingerprint) = tree.open_file_with_fingerprint_token(&conn, token).await?;
     let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
 
     Ok(FileReader::new(

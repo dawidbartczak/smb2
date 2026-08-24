@@ -160,69 +160,102 @@ impl CreateRequest {
 
 impl Pack for CreateRequest {
     fn pack(&self, cursor: &mut WriteCursor) {
-        let start = cursor.position();
+        pack_create_request(self, CreateName::String(&self.name), cursor);
+    }
+}
 
-        // StructureSize (2 bytes)
-        cursor.write_u16_le(Self::STRUCTURE_SIZE);
-        // SecurityFlags (1 byte) -- must be 0
+/// CREATE request that replays an already listed filename byte-for-byte.
+///
+/// Kept crate-private so the public message API remains source compatible;
+/// high-level callers receive an opaque `SmbPathToken` instead.
+pub(crate) struct RawCreateRequest<'a> {
+    request: &'a CreateRequest,
+    name: &'a [u16],
+}
+
+impl<'a> RawCreateRequest<'a> {
+    pub(crate) fn new(request: &'a CreateRequest, name: &'a [u16]) -> Self {
+        Self { request, name }
+    }
+}
+
+impl Pack for RawCreateRequest<'_> {
+    fn pack(&self, cursor: &mut WriteCursor) {
+        pack_create_request(self.request, CreateName::Units(self.name), cursor);
+    }
+}
+
+enum CreateName<'a> {
+    String(&'a str),
+    Units(&'a [u16]),
+}
+
+fn pack_create_request(request: &CreateRequest, name: CreateName<'_>, cursor: &mut WriteCursor) {
+    let start = cursor.position();
+
+    // StructureSize (2 bytes)
+    cursor.write_u16_le(CreateRequest::STRUCTURE_SIZE);
+    // SecurityFlags (1 byte) -- must be 0
+    cursor.write_u8(0);
+    // RequestedOplockLevel (1 byte)
+    cursor.write_u8(request.requested_oplock_level as u8);
+    // ImpersonationLevel (4 bytes)
+    cursor.write_u32_le(request.impersonation_level as u32);
+    // SmbCreateFlags (8 bytes) -- must be 0
+    cursor.write_u64_le(0);
+    // Reserved (8 bytes)
+    cursor.write_u64_le(0);
+    // DesiredAccess (4 bytes)
+    cursor.write_u32_le(request.desired_access.bits());
+    // FileAttributes (4 bytes)
+    cursor.write_u32_le(request.file_attributes);
+    // ShareAccess (4 bytes)
+    cursor.write_u32_le(request.share_access.0);
+    // CreateDisposition (4 bytes)
+    cursor.write_u32_le(request.create_disposition as u32);
+    // CreateOptions (4 bytes)
+    cursor.write_u32_le(request.create_options);
+
+    // NameOffset (2 bytes) -- placeholder, backpatch later
+    let name_offset_pos = cursor.position();
+    cursor.write_u16_le(0);
+    // NameLength (2 bytes) -- placeholder, backpatch later
+    let name_length_pos = cursor.position();
+    cursor.write_u16_le(0);
+    // CreateContextsOffset (4 bytes) -- placeholder
+    let ctx_offset_pos = cursor.position();
+    cursor.write_u32_le(0);
+    // CreateContextsLength (4 bytes) -- placeholder
+    let ctx_length_pos = cursor.position();
+    cursor.write_u32_le(0);
+
+    // Buffer: filename in UTF-16LE
+    // Offsets are from the beginning of the SMB2 header per spec.
+    let name_offset = Header::SIZE + (cursor.position() - start);
+    let name_start = cursor.position();
+    match name {
+        CreateName::String(name) => cursor.write_utf16_le(name),
+        CreateName::Units(units) => cursor.write_utf16_units_le(units.iter().copied()),
+    }
+    let name_byte_len = cursor.position() - name_start;
+
+    // Backpatch name offset and length
+    cursor.set_u16_le_at(name_offset_pos, name_offset as u16);
+    cursor.set_u16_le_at(name_length_pos, name_byte_len as u16);
+
+    // Create contexts (if any)
+    if !request.create_contexts.is_empty() {
+        // Align to 8-byte boundary before create contexts
+        cursor.align_to(8);
+        let ctx_offset = Header::SIZE + (cursor.position() - start);
+        cursor.write_bytes(&request.create_contexts);
+        let ctx_len = request.create_contexts.len();
+
+        cursor.set_u32_le_at(ctx_offset_pos, ctx_offset as u32);
+        cursor.set_u32_le_at(ctx_length_pos, ctx_len as u32);
+    } else if name_byte_len == 0 {
+        // Per spec, buffer must be at least 1 byte even if name is empty
         cursor.write_u8(0);
-        // RequestedOplockLevel (1 byte)
-        cursor.write_u8(self.requested_oplock_level as u8);
-        // ImpersonationLevel (4 bytes)
-        cursor.write_u32_le(self.impersonation_level as u32);
-        // SmbCreateFlags (8 bytes) -- must be 0
-        cursor.write_u64_le(0);
-        // Reserved (8 bytes)
-        cursor.write_u64_le(0);
-        // DesiredAccess (4 bytes)
-        cursor.write_u32_le(self.desired_access.bits());
-        // FileAttributes (4 bytes)
-        cursor.write_u32_le(self.file_attributes);
-        // ShareAccess (4 bytes)
-        cursor.write_u32_le(self.share_access.0);
-        // CreateDisposition (4 bytes)
-        cursor.write_u32_le(self.create_disposition as u32);
-        // CreateOptions (4 bytes)
-        cursor.write_u32_le(self.create_options);
-
-        // NameOffset (2 bytes) -- placeholder, backpatch later
-        let name_offset_pos = cursor.position();
-        cursor.write_u16_le(0);
-        // NameLength (2 bytes) -- placeholder, backpatch later
-        let name_length_pos = cursor.position();
-        cursor.write_u16_le(0);
-        // CreateContextsOffset (4 bytes) -- placeholder
-        let ctx_offset_pos = cursor.position();
-        cursor.write_u32_le(0);
-        // CreateContextsLength (4 bytes) -- placeholder
-        let ctx_length_pos = cursor.position();
-        cursor.write_u32_le(0);
-
-        // Buffer: filename in UTF-16LE
-        // Offsets are from the beginning of the SMB2 header per spec.
-        let name_offset = Header::SIZE + (cursor.position() - start);
-        let name_start = cursor.position();
-        cursor.write_utf16_le(&self.name);
-        let name_byte_len = cursor.position() - name_start;
-
-        // Backpatch name offset and length
-        cursor.set_u16_le_at(name_offset_pos, name_offset as u16);
-        cursor.set_u16_le_at(name_length_pos, name_byte_len as u16);
-
-        // Create contexts (if any)
-        if !self.create_contexts.is_empty() {
-            // Align to 8-byte boundary before create contexts
-            cursor.align_to(8);
-            let ctx_offset = Header::SIZE + (cursor.position() - start);
-            cursor.write_bytes(&self.create_contexts);
-            let ctx_len = self.create_contexts.len();
-
-            cursor.set_u32_le_at(ctx_offset_pos, ctx_offset as u32);
-            cursor.set_u32_le_at(ctx_length_pos, ctx_len as u32);
-        } else if name_byte_len == 0 {
-            // Per spec, buffer must be at least 1 byte even if name is empty
-            cursor.write_u8(0);
-        }
     }
 }
 

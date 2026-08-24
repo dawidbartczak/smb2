@@ -30,6 +30,9 @@ pub const FSCTL_SRV_REQUEST_RESUME_KEY: u32 = 0x0014_0078;
 /// DFS referral request.
 pub const FSCTL_DFS_GET_REFERRALS: u32 = 0x0006_0194;
 
+/// Read the reparse data attached to an opened reparse point.
+pub const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
+
 /// Validate negotiate info (SMB 3.x).
 pub const FSCTL_VALIDATE_NEGOTIATE_INFO: u32 = 0x0014_0204;
 

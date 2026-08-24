@@ -15,9 +15,13 @@ use crate::client::stream::{FileDownload, Progress};
 use crate::error::Result;
 use crate::msg::close::{CloseRequest, CloseResponse, SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB};
 use crate::msg::create::{
-    CreateDisposition, CreateRequest, CreateResponse, ImpersonationLevel, ShareAccess,
+    CreateDisposition, CreateRequest, CreateResponse, ImpersonationLevel, RawCreateRequest,
+    ShareAccess,
 };
 use crate::msg::flush::FlushRequest;
+use crate::msg::ioctl::{
+    IoctlRequest, IoctlResponse, FSCTL_GET_REPARSE_POINT, SMB2_0_IOCTL_IS_FSCTL,
+};
 use crate::msg::query_directory::{
     FileInformationClass, QueryDirectoryFlags, QueryDirectoryRequest, QueryDirectoryResponse,
 };
@@ -78,11 +82,17 @@ fn all_or_first_err(
 /// File attribute constant: the entry is a directory.
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 
+/// File attribute constant: the entry is backed by a reparse point.
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
 /// Create option: the target must be a directory.
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 
 /// Create option: the target must not be a directory.
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+
+/// Open the reparse point itself instead of following it.
+const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 /// FileBasicInformation class for QUERY_INFO (MS-FSCC 2.4.7).
 const FILE_BASIC_INFORMATION: u8 = 4;
@@ -99,11 +109,115 @@ const FILE_DISPOSITION_INFORMATION: u8 = 13;
 /// FileFsFullSizeInformation class for QUERY_INFO (MS-FSCC 2.5.4).
 const FILE_FS_FULL_SIZE_INFORMATION: u8 = 7;
 
+/// FileFsVolumeInformation class for QUERY_INFO.
+const FILE_FS_VOLUME_INFORMATION: u8 = 1;
+
+/// Offset of VolumeSerialNumber in FileFsVolumeInformation.
+const FILE_FS_VOLUME_SERIAL_OFFSET: usize = 8;
+
+/// Maximum reparse payload defined by Windows, including the fixed header.
+const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: u32 = 16 * 1024;
+
+/// Microsoft symbolic-link reparse tag.
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+
+/// Microsoft mount-point/junction reparse tag.
+const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+
+/// Exact server path captured from a directory listing.
+///
+/// The UTF-16 code units are intentionally opaque. Reopening through this
+/// token bypasses caller-path encoding, so a literal control character and
+/// the private-use character another SMB client uses to represent it cannot
+/// be confused. Tokens are scoped to the [`Tree`] that produced them.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct SmbPathToken {
+    wire_path: Vec<u16>,
+}
+
+impl std::fmt::Debug for SmbPathToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SmbPathToken")
+            .field("utf16_units", &self.wire_path.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SmbPathToken {
+    fn from_wire_path(wire_path: Vec<u16>) -> Self {
+        Self { wire_path }
+    }
+
+    fn child(&self, name: &[u16]) -> Self {
+        let mut wire_path = self.wire_path.clone();
+        if !wire_path.is_empty() {
+            wire_path.push(u16::from(b'\\'));
+        }
+        wire_path.extend_from_slice(name);
+        Self { wire_path }
+    }
+
+    fn units(&self) -> &[u16] {
+        &self.wire_path
+    }
+}
+
+/// Stable source identity scoped to one non-zero SMB volume serial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SourceObjectId {
+    /// Serial reported by FileFsVolumeInformation.
+    pub volume_serial: u32,
+    /// Non-zero FileId from FileIdBothDirectoryInformation.
+    pub file_id: u64,
+}
+
+impl SourceObjectId {
+    /// Construct an identity only when both server-provided components are
+    /// usable. Zero means "identity unavailable", never a stable object.
+    #[must_use]
+    pub fn new(volume_serial: u32, file_id: u64) -> Option<Self> {
+        (volume_serial != 0 && file_id != 0).then_some(Self {
+            volume_serial,
+            file_id,
+        })
+    }
+}
+
+/// Meaning of a reparse point read with `FSCTL_GET_REPARSE_POINT`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReparseKind {
+    /// Windows symbolic link.
+    SymbolicLink,
+    /// Windows mount point / junction.
+    Junction,
+    /// A non-directory reparse point whose ordinary file payload is data.
+    FileLike,
+    /// A tag the client cannot safely classify.
+    Unknown,
+}
+
+/// Reparse metadata returned without following the entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReparseDescriptor {
+    /// Raw reparse tag assigned by the server.
+    pub tag: u32,
+    /// Safe high-level classification.
+    pub kind: ReparseKind,
+    /// Print-name target for symbolic links and junctions.
+    pub target: Option<String>,
+}
+
 /// A directory entry returned by [`Tree::list_directory`].
 #[derive(Debug, Clone)]
 pub struct DirectoryEntry {
-    /// The file or directory name.
+    /// Human-facing filename decoded with the platform interop mapping.
     pub name: String,
+    /// Lossless archive-facing component derived from the literal wire name.
+    /// It is never used to reopen the source.
+    pub archive_name: String,
+    /// Exact full path to use for subsequent source operations.
+    pub reopen_token: SmbPathToken,
     /// The file size in bytes (0 for directories).
     pub size: u64,
     /// Whether this entry is a directory.
@@ -121,6 +235,22 @@ pub struct DirectoryEntry {
 }
 
 impl DirectoryEntry {
+    /// Whether the entry must be classified through
+    /// [`Tree::reparse_descriptor_token`] before it is treated as a file or
+    /// directory.
+    #[must_use]
+    pub fn is_reparse_point(&self) -> bool {
+        (self.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    }
+
+    /// Return a trustworthy identity only when the caller has also obtained a
+    /// non-zero serial for this volume.
+    #[must_use]
+    pub fn source_object_id(&self, volume_serial: u32) -> Option<SourceObjectId> {
+        self.stable_id
+            .and_then(|file_id| SourceObjectId::new(volume_serial, file_id))
+    }
+
     /// Metadata captured by directory enumeration for consistency checks.
     #[must_use]
     pub fn fingerprint(&self) -> FileFingerprint {
@@ -374,6 +504,16 @@ impl Tree {
         }
     }
 
+    /// Encode a caller path once and retain its exact UTF-16 wire form.
+    ///
+    /// Tokens returned in [`DirectoryEntry::reopen_token`] are preferable for
+    /// anything discovered by a listing. This constructor is for a configured
+    /// source root that has not itself been listed yet.
+    #[must_use]
+    pub fn path_token(&self, path: &str) -> SmbPathToken {
+        SmbPathToken::from_wire_path(self.format_path(path).encode_utf16().collect())
+    }
+
     /// List files in a directory.
     ///
     /// Opens the directory with CREATE, queries entries with QUERY_DIRECTORY
@@ -383,13 +523,23 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
     ) -> Result<Vec<DirectoryEntry>> {
+        let token = self.path_token(path);
+        self.list_directory_token(conn, &token).await
+    }
+
+    /// List a directory using the exact token returned by its parent listing.
+    pub async fn list_directory_token(
+        &self,
+        conn: &mut Connection,
+        token: &SmbPathToken,
+    ) -> Result<Vec<DirectoryEntry>> {
         // TRACE, not DEBUG: a recursive scan calls list_directory once per directory
         // (millions of times on a large share), so at DEBUG it dominates a consumer's
         // log. Per-operation mutations (rename/delete/write) stay at DEBUG. See AGENTS.md.
-        trace!("tree: list_directory path={}", path);
+        trace!("tree: list_directory token={token:?}");
 
         // Open the directory.
-        let file_id = self.open_directory(conn, path).await?;
+        let file_id = self.open_directory_token(conn, token).await?;
 
         // Query directory entries.
         let result = self.query_directory_loop(conn, file_id).await;
@@ -398,8 +548,11 @@ impl Tree {
         let close_result = self.close_handle(conn, file_id).await;
 
         // Return the query result, or if it succeeded, check the close result.
-        let entries = result?;
+        let mut entries = result?;
         close_result?;
+        for entry in &mut entries {
+            entry.reopen_token = token.child(entry.reopen_token.units());
+        }
         trace!("tree: list_directory done, entries={}", entries.len());
         Ok(entries)
     }
@@ -422,10 +575,11 @@ impl Tree {
         path: &str,
         query_buffer_len: Option<u32>,
     ) -> Result<(Vec<DirectoryEntry>, ListingTrace)> {
+        let token = self.path_token(path);
         let buffer_len = query_buffer_len.unwrap_or_else(|| Self::default_query_buffer_len(conn));
 
         let create_start = Instant::now();
-        let file_id = self.open_directory(conn, path).await?;
+        let file_id = self.open_directory_token(conn, &token).await?;
         let create = create_start.elapsed();
 
         let mut queries = Vec::new();
@@ -468,6 +622,9 @@ impl Tree {
         query_result?;
         close_result?;
 
+        for entry in &mut all_entries {
+            entry.reopen_token = token.child(entry.reopen_token.units());
+        }
         let trace = ListingTrace {
             create,
             queries,
@@ -657,7 +814,18 @@ impl Tree {
         path: &str,
         expected_size: u64,
     ) -> Result<CompoundRead> {
-        let normalized = self.format_path(path);
+        let token = self.path_token(path);
+        self.read_file_compound_sized_token(conn, &token, expected_size)
+            .await
+    }
+
+    /// Read a listed small file using its exact wire path token.
+    pub async fn read_file_compound_sized_token(
+        &self,
+        conn: &Connection,
+        token: &SmbPathToken,
+        expected_size: u64,
+    ) -> Result<CompoundRead> {
         let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
         if expected_size > u64::from(max_read) {
             return Err(Error::FileTooLargeForSingleRead {
@@ -682,9 +850,10 @@ impl Tree {
             ),
             create_disposition: CreateDisposition::FileOpen,
             create_options: FILE_NON_DIRECTORY_FILE,
-            name: normalized.clone(),
+            name: String::new(),
             create_contexts: vec![],
         };
+        let create_req = RawCreateRequest::new(&create_req, token.units());
         let read_len = expected_size as u32;
         let read_credit_charge = u16::try_from(u64::from(read_len).div_ceil(65536).max(1))
             .map_err(|_| {
@@ -732,7 +901,7 @@ impl Tree {
 
         trace!(
             "tree: read_file_compound_sized path={}, expected_size={}, ops={}, read_credits={}",
-            normalized,
+            format_args!("{token:?}"),
             expected_size,
             ops.len(),
             if expected_size == 0 {
@@ -821,7 +990,7 @@ impl Tree {
         let close_response = CloseResponse::unpack(&mut close_cursor)?;
         if close_response.flags & SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB == 0 {
             return Err(Error::invalid_data(format!(
-                "compound CLOSE for {path:?} omitted requested post-query attributes"
+                "compound CLOSE for {token:?} omitted requested post-query attributes"
             )));
         }
         let closed = FileFingerprint::from_close(&close_response);
@@ -972,8 +1141,17 @@ impl Tree {
     /// Sends CREATE + QUERY_INFO (FileBasicInformation) +
     /// QUERY_INFO (FileStandardInformation) + CLOSE as a single compound message.
     pub async fn stat(&self, conn: &mut Connection, path: &str) -> Result<FileInfo> {
-        let normalized = self.format_path(path);
-        trace!("tree: stat (compound) path={}", normalized);
+        let token = self.path_token(path);
+        self.stat_token(conn, &token).await
+    }
+
+    /// Get metadata for a listed path without re-encoding its display name.
+    pub async fn stat_token(
+        &self,
+        conn: &mut Connection,
+        token: &SmbPathToken,
+    ) -> Result<FileInfo> {
+        trace!("tree: stat (compound) token={token:?}");
 
         // BUILD CREATE request for reading attributes.
         let create_req = CreateRequest {
@@ -990,9 +1168,10 @@ impl Tree {
             ),
             create_disposition: CreateDisposition::FileOpen,
             create_options: 0,
-            name: normalized.clone(),
+            name: String::new(),
             create_contexts: vec![],
         };
+        let create_req = RawCreateRequest::new(&create_req, token.units());
 
         // QUERY_INFO for FileBasicInformation (timestamps + attributes).
         let basic_req = QueryInfoRequest {
@@ -1337,6 +1516,171 @@ impl Tree {
             bytes_per_sector,
             sectors_per_unit,
         })
+    }
+
+    /// Read the non-zero serial that scopes directory-entry file IDs.
+    ///
+    /// `Ok(None)` means the server declined the filesystem information or
+    /// returned zero; callers must then treat every listing ID as unavailable.
+    pub async fn volume_serial(&self, conn: &mut Connection) -> Result<Option<u32>> {
+        let create_req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_READ_ATTRIBUTES | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0,
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: FILE_DIRECTORY_FILE,
+            name: String::new(),
+            create_contexts: vec![],
+        };
+        let query_req = QueryInfoRequest {
+            info_type: InfoType::Filesystem,
+            file_info_class: FILE_FS_VOLUME_INFORMATION,
+            output_buffer_length: 128,
+            additional_information: 0,
+            flags: 0,
+            file_id: FileId::SENTINEL,
+            input_buffer: vec![],
+        };
+        let close_req = CloseRequest {
+            flags: 0,
+            file_id: FileId::SENTINEL,
+        };
+        let ops = [
+            CompoundOp {
+                command: Command::Create,
+                body: &create_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::QueryInfo,
+                body: &query_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::Close,
+                body: &close_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+        ];
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
+        if responses[0].header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: responses[0].header.status,
+                command: Command::Create,
+            });
+        }
+        if responses[1].header.status != NtStatus::SUCCESS {
+            return Ok(None);
+        }
+        let response = QueryInfoResponse::unpack(&mut ReadCursor::new(&responses[1].body))?;
+        let Some(bytes) = response
+            .output_buffer
+            .get(FILE_FS_VOLUME_SERIAL_OFFSET..FILE_FS_VOLUME_SERIAL_OFFSET.saturating_add(4))
+        else {
+            return Ok(None);
+        };
+        let serial = u32::from_le_bytes(bytes.try_into().expect("four-byte slice"));
+        Ok((serial != 0).then_some(serial))
+    }
+
+    /// Inspect a listed reparse point without following it.
+    pub async fn reparse_descriptor_token(
+        &self,
+        conn: &Connection,
+        token: &SmbPathToken,
+        is_directory: bool,
+    ) -> Result<ReparseDescriptor> {
+        let create_req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_READ_ATTRIBUTES | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0,
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: FILE_OPEN_REPARSE_POINT
+                | if is_directory {
+                    FILE_DIRECTORY_FILE
+                } else {
+                    FILE_NON_DIRECTORY_FILE
+                },
+            name: String::new(),
+            create_contexts: vec![],
+        };
+        let create_req = RawCreateRequest::new(&create_req, token.units());
+        let ioctl_req = IoctlRequest {
+            ctl_code: FSCTL_GET_REPARSE_POINT,
+            file_id: FileId::SENTINEL,
+            max_input_response: 0,
+            max_output_response: MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
+            flags: SMB2_0_IOCTL_IS_FSCTL,
+            input_data: vec![],
+        };
+        let close_req = CloseRequest {
+            flags: 0,
+            file_id: FileId::SENTINEL,
+        };
+        let ops = [
+            CompoundOp {
+                command: Command::Create,
+                body: &create_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::Ioctl,
+                body: &ioctl_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::Close,
+                body: &close_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+        ];
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
+        if responses[0].header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: responses[0].header.status,
+                command: Command::Create,
+            });
+        }
+        if responses[1].header.status != NtStatus::SUCCESS {
+            let mut cursor = ReadCursor::new(&responses[0].body);
+            let create = CreateResponse::unpack(&mut cursor)?;
+            let mut cleanup = conn.clone();
+            let _ = self.close_handle(&mut cleanup, create.file_id).await;
+            return Err(Error::Protocol {
+                status: responses[1].header.status,
+                command: Command::Ioctl,
+            });
+        }
+        if responses[2].header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: responses[2].header.status,
+                command: Command::Close,
+            });
+        }
+        let response = IoctlResponse::unpack(&mut ReadCursor::new(&responses[1].body))?;
+        parse_reparse_descriptor(&response.output_data, is_directory)
     }
 
     /// Rename or move a file within the same share using a compound request (1 round-trip).
@@ -2063,6 +2407,15 @@ impl Tree {
         super::stream::open_file_reader(Arc::clone(self), conn, path).await
     }
 
+    /// Open a random-access reader using a path token from directory listing.
+    pub async fn open_file_reader_token(
+        self: &Arc<Self>,
+        conn: Connection,
+        token: &SmbPathToken,
+    ) -> Result<super::stream::FileReader> {
+        super::stream::open_file_reader_token(Arc::clone(self), conn, token).await
+    }
+
     /// Create a push-based pipelined streaming writer that owns its
     /// `Connection` and `Arc<Tree>`.
     ///
@@ -2296,7 +2649,15 @@ impl Tree {
 
     /// Open a directory handle.
     async fn open_directory(&self, conn: &mut Connection, path: &str) -> Result<FileId> {
-        let path = self.format_path(path);
+        let token = self.path_token(path);
+        self.open_directory_token(conn, &token).await
+    }
+
+    async fn open_directory_token(
+        &self,
+        conn: &mut Connection,
+        token: &SmbPathToken,
+    ) -> Result<FileId> {
         let req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
@@ -2313,9 +2674,10 @@ impl Tree {
             ),
             create_disposition: CreateDisposition::FileOpen,
             create_options: FILE_DIRECTORY_FILE,
-            name: path,
+            name: String::new(),
             create_contexts: vec![],
         };
+        let req = RawCreateRequest::new(&req, token.units());
 
         let frame = conn
             .execute(Command::Create, &req, Some(self.tree_id))
@@ -2362,7 +2724,15 @@ impl Tree {
         conn: &Connection,
         path: &str,
     ) -> Result<(FileId, FileFingerprint)> {
-        let path = self.format_path(path);
+        let token = self.path_token(path);
+        self.open_file_with_fingerprint_token(conn, &token).await
+    }
+
+    pub(crate) async fn open_file_with_fingerprint_token(
+        &self,
+        conn: &Connection,
+        token: &SmbPathToken,
+    ) -> Result<(FileId, FileFingerprint)> {
         let req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
@@ -2379,9 +2749,10 @@ impl Tree {
             ),
             create_disposition: CreateDisposition::FileOpen,
             create_options: 0,
-            name: path,
+            name: String::new(),
             create_contexts: vec![],
         };
+        let req = RawCreateRequest::new(&req, token.units());
 
         let frame = conn
             .execute(Command::Create, &req, Some(self.tree_id))
@@ -3481,6 +3852,123 @@ fn normalize_path(path: &str) -> String {
     crate::name::encode_path(path)
 }
 
+/// Project arbitrary UTF-16 into one manifest-safe path component.
+///
+/// Valid scalar values are kept verbatim except path separators, NUL and the
+/// escape marker. Unpaired surrogates are escaped as their original code unit.
+/// Because the marker itself is escaped, this projection is injective.
+fn archive_name_from_utf16(units: &[u16]) -> String {
+    const ESCAPE: char = '\u{F0000}';
+
+    fn push_escape(out: &mut String, value: u32) {
+        use std::fmt::Write as _;
+        out.push('\u{F0000}');
+        let _ = write!(out, "{value:06X};");
+    }
+
+    let mut out = String::new();
+    for decoded in char::decode_utf16(units.iter().copied()) {
+        match decoded {
+            Ok(value) if value != ESCAPE && value != '/' && value != '\\' && value != '\0' => {
+                out.push(value);
+            }
+            Ok(value) => push_escape(&mut out, value as u32),
+            Err(error) => push_escape(&mut out, u32::from(error.unpaired_surrogate())),
+        }
+    }
+    out
+}
+
+fn parse_reparse_descriptor(data: &[u8], is_directory: bool) -> Result<ReparseDescriptor> {
+    if data.len() < 8 {
+        return Err(Error::invalid_data(format!(
+            "reparse buffer too short: {} bytes",
+            data.len()
+        )));
+    }
+    let tag = u32::from_le_bytes(data[0..4].try_into().expect("four-byte slice"));
+    let payload_len = usize::from(u16::from_le_bytes(
+        data[4..6].try_into().expect("two-byte slice"),
+    ));
+    let end = 8usize
+        .checked_add(payload_len)
+        .ok_or_else(|| Error::invalid_data("reparse payload length overflow"))?;
+    if end > data.len() {
+        return Err(Error::invalid_data(format!(
+            "reparse payload declares {payload_len} bytes, only {} available",
+            data.len().saturating_sub(8)
+        )));
+    }
+
+    let target = match tag {
+        IO_REPARSE_TAG_SYMLINK => parse_reparse_target(data, end, 20, 8, 10, 12, 14)?,
+        IO_REPARSE_TAG_MOUNT_POINT => parse_reparse_target(data, end, 16, 8, 10, 12, 14)?,
+        _ => None,
+    };
+    let kind = match tag {
+        IO_REPARSE_TAG_SYMLINK => ReparseKind::SymbolicLink,
+        IO_REPARSE_TAG_MOUNT_POINT => ReparseKind::Junction,
+        _ if !is_directory => ReparseKind::FileLike,
+        _ => ReparseKind::Unknown,
+    };
+    Ok(ReparseDescriptor { tag, kind, target })
+}
+
+fn parse_reparse_target(
+    data: &[u8],
+    end: usize,
+    path_buffer_offset: usize,
+    substitute_offset_field: usize,
+    substitute_length_field: usize,
+    print_offset_field: usize,
+    print_length_field: usize,
+) -> Result<Option<String>> {
+    if end < path_buffer_offset {
+        return Err(Error::invalid_data("reparse name fields are truncated"));
+    }
+    let read_u16 = |at: usize| -> Result<usize> {
+        let bytes = data
+            .get(at..at.saturating_add(2))
+            .ok_or_else(|| Error::invalid_data("reparse name field is truncated"))?;
+        Ok(usize::from(u16::from_le_bytes(
+            bytes.try_into().expect("two-byte slice"),
+        )))
+    };
+    let substitute_offset = read_u16(substitute_offset_field)?;
+    let substitute_length = read_u16(substitute_length_field)?;
+    let print_offset = read_u16(print_offset_field)?;
+    let print_length = read_u16(print_length_field)?;
+    let (offset, length) = if print_length != 0 {
+        (print_offset, print_length)
+    } else {
+        (substitute_offset, substitute_length)
+    };
+    if length == 0 {
+        return Ok(Some(String::new()));
+    }
+    if offset % 2 != 0 || length % 2 != 0 {
+        return Err(Error::invalid_data(
+            "reparse target offset and length must be UTF-16 aligned",
+        ));
+    }
+    let start = path_buffer_offset
+        .checked_add(offset)
+        .ok_or_else(|| Error::invalid_data("reparse target offset overflow"))?;
+    let target_end = start
+        .checked_add(length)
+        .ok_or_else(|| Error::invalid_data("reparse target length overflow"))?;
+    if target_end > end {
+        return Err(Error::invalid_data("reparse target points outside payload"));
+    }
+    let units = data[start..target_end]
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&units)
+        .map(Some)
+        .map_err(|_| Error::invalid_data("reparse target contains invalid UTF-16"))
+}
+
 /// Parse `FileIdBothDirectoryInformation` entries from raw bytes.
 ///
 /// Each entry has:
@@ -3529,26 +4017,27 @@ fn parse_file_id_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>>
         // ShortName: 24 bytes (fixed, null-padded).
         cursor.skip(24)?;
         let stable_id = cursor.read_u64_le()?;
-        // FileName: FileNameLength bytes in UTF-16LE. A single component, so
-        // it decodes with `decode_name`, not `decode_path`: a `\` that comes
-        // back here is a character in the name (see `crate::name`).
-        let name = if file_name_length > 0 {
-            crate::name::decode_name(&cursor.read_utf16_le(file_name_length)?).into_owned()
-        } else {
-            String::new()
-        };
+        // Preserve the literal code units for every later CREATE. The decoded
+        // display name is deliberately separate from the lossless archive
+        // component: the Services-for-Macintosh PUA mapping is not bijective.
+        let wire_name = cursor.read_utf16_units_le(file_name_length)?;
+        let literal_name = String::from_utf16_lossy(&wire_name);
+        let name = crate::name::decode_name(&literal_name).into_owned();
+        let archive_name = archive_name_from_utf16(&wire_name);
 
         let is_directory = (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 
         entries.push(DirectoryEntry {
             name,
+            archive_name,
+            reopen_token: SmbPathToken::from_wire_path(wire_name),
             size: end_of_file,
             is_directory,
             created: creation_time,
             modified: last_write_time,
             change_time,
             file_attributes,
-            stable_id: Some(stable_id),
+            stable_id: (stable_id != 0).then_some(stable_id),
         });
 
         if next_entry_offset == 0 {
@@ -3680,6 +4169,21 @@ mod tests {
         next_offset: u32,
     ) -> Vec<u8> {
         let name_u16: Vec<u16> = name.encode_utf16().collect();
+        let attrs = if is_directory {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            0x00000020 // ARCHIVE
+        };
+        build_file_both_dir_info_units(&name_u16, size, attrs, next_offset, 0xfeed_0000_0000_0001)
+    }
+
+    fn build_file_both_dir_info_units(
+        name_u16: &[u16],
+        size: u64,
+        attrs: u32,
+        next_offset: u32,
+        stable_id: u64,
+    ) -> Vec<u8> {
         let name_bytes_len = name_u16.len() * 2;
 
         let mut buf = Vec::new();
@@ -3700,11 +4204,6 @@ mod tests {
         // AllocationSize (8)
         buf.extend_from_slice(&((size + 4095) & !4095).to_le_bytes());
         // FileAttributes (4)
-        let attrs = if is_directory {
-            FILE_ATTRIBUTE_DIRECTORY
-        } else {
-            0x00000020 // ARCHIVE
-        };
         buf.extend_from_slice(&attrs.to_le_bytes());
         // FileNameLength (4)
         buf.extend_from_slice(&(name_bytes_len as u32).to_le_bytes());
@@ -3717,13 +4216,44 @@ mod tests {
         // ShortName (24 bytes, zero-padded)
         buf.extend_from_slice(&[0u8; 24]);
         // FileId (8)
-        buf.extend_from_slice(&0xfeed_0000_0000_0001u64.to_le_bytes());
+        buf.extend_from_slice(&stable_id.to_le_bytes());
         // FileName (variable)
-        for &u in &name_u16 {
+        for &u in name_u16 {
             buf.extend_from_slice(&u.to_le_bytes());
         }
 
         buf
+    }
+
+    fn build_name_reparse_buffer(
+        tag: u32,
+        substitute: &str,
+        print: &str,
+        symbolic_link: bool,
+    ) -> Vec<u8> {
+        let substitute: Vec<u16> = substitute.encode_utf16().collect();
+        let print: Vec<u16> = print.encode_utf16().collect();
+        let substitute_len = u16::try_from(substitute.len() * 2).unwrap();
+        let print_len = u16::try_from(print.len() * 2).unwrap();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(&substitute_len.to_le_bytes());
+        payload.extend_from_slice(&substitute_len.to_le_bytes());
+        payload.extend_from_slice(&print_len.to_le_bytes());
+        if symbolic_link {
+            payload.extend_from_slice(&0u32.to_le_bytes());
+        }
+        for unit in substitute.into_iter().chain(print) {
+            payload.extend_from_slice(&unit.to_le_bytes());
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&payload);
+        out
     }
 
     #[tokio::test]
@@ -3973,6 +4503,181 @@ mod tests {
         let data = build_file_both_dir_info("a\u{F025}b", 7, false, 0);
         let entries = parse_file_id_both_directory_info(&data).unwrap();
         assert_eq!(entries[0].name, "a?b");
+    }
+
+    #[test]
+    fn listed_wire_names_have_injective_archive_names_and_exact_tokens() {
+        let control = build_file_both_dir_info_units(&[0x0019, 0x0061], 7, 0x20, 0, 11);
+        let private_use = build_file_both_dir_info_units(&[0xF019, 0x0061], 7, 0x20, 0, 12);
+        let trailing = build_file_both_dir_info_units(&[0x0061, 0x002E, 0x0020], 7, 0x20, 0, 13);
+        let unpaired = build_file_both_dir_info_units(&[0xD800, 0x0061], 7, 0x20, 0, 14);
+
+        let control = parse_file_id_both_directory_info(&control)
+            .unwrap()
+            .remove(0);
+        let private_use = parse_file_id_both_directory_info(&private_use)
+            .unwrap()
+            .remove(0);
+        let trailing = parse_file_id_both_directory_info(&trailing)
+            .unwrap()
+            .remove(0);
+        let unpaired = parse_file_id_both_directory_info(&unpaired)
+            .unwrap()
+            .remove(0);
+
+        // Human display decoding can collide, but neither the archive name nor
+        // the reopen identity is allowed to collide.
+        assert_eq!(control.name, private_use.name);
+        assert_ne!(control.archive_name, private_use.archive_name);
+        assert_ne!(control.reopen_token, private_use.reopen_token);
+        assert_eq!(control.reopen_token.units(), &[0x0019, 0x0061]);
+        assert_eq!(private_use.reopen_token.units(), &[0xF019, 0x0061]);
+
+        assert_eq!(trailing.archive_name, "a. ");
+        assert_eq!(trailing.reopen_token.units(), &[0x0061, 0x002E, 0x0020]);
+
+        assert_eq!(unpaired.reopen_token.units(), &[0xD800, 0x0061]);
+        assert!(!unpaired.archive_name.contains('\u{FFFD}'));
+        assert!(unpaired.archive_name.starts_with('\u{F0000}'));
+    }
+
+    #[tokio::test]
+    async fn listed_control_character_reopens_with_the_literal_wire_token() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+        };
+        let listed = build_file_both_dir_info_units(
+            &[
+                0x0019, 0x0073, 0x0069, 0x0065, 0x006D, 0x0061, 0x002E, 0x0074, 0x0078, 0x0074,
+            ],
+            4,
+            0x20,
+            0,
+            99,
+        );
+        mock.queue_response(build_create_response(
+            FileId {
+                persistent: 1,
+                volatile: 2,
+            },
+            0,
+        ));
+        mock.queue_response(build_query_directory_response(NtStatus::SUCCESS, listed));
+        mock.queue_response(build_query_directory_response(
+            NtStatus::NO_MORE_FILES,
+            vec![],
+        ));
+        mock.queue_response(build_close_response());
+
+        let entries = tree.list_directory(&mut conn, "somedir").await.unwrap();
+        assert_eq!(
+            entries[0].reopen_token.units(),
+            "somedir\\\u{0019}siema.txt"
+                .encode_utf16()
+                .collect::<Vec<_>>()
+        );
+
+        let fingerprint = FileFingerprint {
+            size: 4,
+            modified: FileTime(1),
+            change_time: FileTime(2),
+        };
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_fingerprint_response(
+                FileId {
+                    persistent: 3,
+                    volatile: 4,
+                },
+                fingerprint,
+            ),
+            build_read_response(NtStatus::SUCCESS, vec![1, 2, 3, 4]),
+            build_close_fingerprint_response(fingerprint),
+        ]));
+        tree.read_file_compound_sized_token(&conn, &entries[0].reopen_token, 4)
+            .await
+            .unwrap();
+
+        let sent = mock.sent_message(4).unwrap();
+        let mut cursor = ReadCursor::new(&sent);
+        let header = Header::unpack(&mut cursor).unwrap();
+        assert_eq!(header.command, Command::Create);
+        let request = CreateRequest::unpack(&mut cursor).unwrap();
+        assert_eq!(request.name, "somedir\\\u{0019}siema.txt");
+        assert_ne!(request.name, "somedir\\\u{F019}siema.txt");
+    }
+
+    #[test]
+    fn zero_file_ids_and_zero_volume_serials_are_not_stable() {
+        let data = build_file_both_dir_info_units(&[0x0061], 1, 0x20, 0, 0);
+        let entry = parse_file_id_both_directory_info(&data).unwrap().remove(0);
+        assert_eq!(entry.stable_id, None);
+        assert_eq!(entry.source_object_id(42), None);
+        assert_eq!(SourceObjectId::new(0, 7), None);
+        assert_eq!(SourceObjectId::new(7, 0), None);
+        assert_eq!(
+            SourceObjectId::new(7, 9),
+            Some(SourceObjectId {
+                volume_serial: 7,
+                file_id: 9,
+            })
+        );
+    }
+
+    #[test]
+    fn reparse_descriptors_distinguish_links_file_like_and_unknown_entries() {
+        let symlink =
+            build_name_reparse_buffer(IO_REPARSE_TAG_SYMLINK, r"\??\C:\source", r"C:\source", true);
+        let junction = build_name_reparse_buffer(
+            IO_REPARSE_TAG_MOUNT_POINT,
+            r"\??\C:\folder",
+            r"C:\folder",
+            false,
+        );
+        assert_eq!(
+            parse_reparse_descriptor(&symlink, false).unwrap(),
+            ReparseDescriptor {
+                tag: IO_REPARSE_TAG_SYMLINK,
+                kind: ReparseKind::SymbolicLink,
+                target: Some(r"C:\source".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_reparse_descriptor(&junction, true).unwrap(),
+            ReparseDescriptor {
+                tag: IO_REPARSE_TAG_MOUNT_POINT,
+                kind: ReparseKind::Junction,
+                target: Some(r"C:\folder".to_string()),
+            }
+        );
+
+        let mut unknown = Vec::new();
+        unknown.extend_from_slice(&0x8000_1234u32.to_le_bytes());
+        unknown.extend_from_slice(&0u16.to_le_bytes());
+        unknown.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(
+            parse_reparse_descriptor(&unknown, false).unwrap().kind,
+            ReparseKind::FileLike
+        );
+        assert_eq!(
+            parse_reparse_descriptor(&unknown, true).unwrap().kind,
+            ReparseKind::Unknown
+        );
+    }
+
+    #[test]
+    fn malformed_reparse_targets_are_rejected() {
+        assert!(parse_reparse_descriptor(&[0; 7], false).is_err());
+
+        let mut symlink =
+            build_name_reparse_buffer(IO_REPARSE_TAG_SYMLINK, r"\??\C:\source", r"C:\source", true);
+        symlink[12..14].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(parse_reparse_descriptor(&symlink, false).is_err());
     }
 
     #[tokio::test]

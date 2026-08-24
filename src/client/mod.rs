@@ -38,7 +38,8 @@ pub use session::Session;
 pub use shares::list_shares;
 pub use stream::{CloseDeadlines, FileDownload, FileUpload, FileWriter, Progress};
 pub use tree::{
-    CompoundRead, DirectoryEntry, FileFingerprint, FileInfo, FsInfo, ListingTrace, QueryStep, Tree,
+    CompoundRead, DirectoryEntry, FileFingerprint, FileInfo, FsInfo, ListingTrace, QueryStep,
+    ReparseDescriptor, ReparseKind, SmbPathToken, SourceObjectId, Tree,
 };
 pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 

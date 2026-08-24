@@ -15,6 +15,12 @@ One sub-module per SMB2 command. Each defines request and response structs with 
 
 19 command modules total: negotiate, session_setup, logoff, tree_connect, tree_disconnect, create, close, flush, read, write, lock, ioctl, query_directory, change_notify, query_info, set_info, echo, cancel, oplock_break. Plus `dfs.rs` for DFS referral request/response wire format (used by IOCTL FSCTL_DFS_GET_REFERRALS) and `copychunk.rs` for the server-side copy structures (`SrvCopychunkCopy` / `SrvCopychunkResponse` / `SrvRequestResumeKeyResponse`, used by IOCTL FSCTL_SRV_COPYCHUNK / FSCTL_SRV_REQUEST_RESUME_KEY; the client API is in `client/copy.rs`).
 
+`CreateRequest` remains the public String-based message type. `RawCreateRequest`
+is crate-private and exists solely for replaying the exact UTF-16 code units in
+an opaque `SmbPathToken` captured by directory enumeration. It shares the same
+packer and fields as `CreateRequest`; do not decode and re-encode a listed name
+before CREATE, because the display mapping has intentional PUA collisions.
+
 ## Patterns
 
 - **Pack/Unpack**: All structs implement `pack(&self, &mut WriteCursor)` and `unpack(&mut ReadCursor) -> Result<Self>`. Hand-rolled, no proc macros.
