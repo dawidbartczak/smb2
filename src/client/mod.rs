@@ -712,6 +712,19 @@ impl SmbClient {
         }
     }
 
+    /// List a directory through the exact token captured from its parent.
+    ///
+    /// The token is already bound to a resolved tree path, so this method does
+    /// not reinterpret it through DFS or filename display codecs.
+    pub async fn list_directory_token(
+        &mut self,
+        tree: &Tree,
+        token: &tree::SmbPathToken,
+    ) -> Result<Vec<DirectoryEntry>> {
+        let conn = self.connection_for_tree(tree);
+        tree.list_directory_token(conn, token).await
+    }
+
     /// Read a file from the given share.
     pub async fn read_file(&mut self, tree: &mut Tree, path: &str) -> Result<Vec<u8>> {
         let result = {
@@ -788,6 +801,18 @@ impl SmbClient {
             }
             other => other,
         }
+    }
+
+    /// Read a listed file with its exact wire token and size-aware compound.
+    pub async fn read_file_compound_sized_token(
+        &mut self,
+        tree: &Tree,
+        token: &tree::SmbPathToken,
+        expected_size: u64,
+    ) -> Result<CompoundRead> {
+        let conn = self.connection_for_tree(tree);
+        tree.read_file_compound_sized_token(conn, token, expected_size)
+            .await
     }
 
     /// Read a file using pipelined I/O (faster for large files).
@@ -951,6 +976,34 @@ impl SmbClient {
             }
             other => other,
         }
+    }
+
+    /// Query metadata through an exact token captured by directory listing.
+    pub async fn stat_token(
+        &mut self,
+        tree: &Tree,
+        token: &tree::SmbPathToken,
+    ) -> Result<FileInfo> {
+        let conn = self.connection_for_tree(tree);
+        tree.stat_token(conn, token).await
+    }
+
+    /// Read and classify a reparse point without following it.
+    pub async fn reparse_descriptor_token(
+        &mut self,
+        tree: &Tree,
+        token: &tree::SmbPathToken,
+        is_directory: bool,
+    ) -> Result<tree::ReparseDescriptor> {
+        let conn = self.connection_for_tree(tree);
+        tree.reparse_descriptor_token(conn, token, is_directory)
+            .await
+    }
+
+    /// Read the non-zero serial that scopes file IDs for this tree.
+    pub async fn volume_serial(&mut self, tree: &Tree) -> Result<Option<u32>> {
+        let conn = self.connection_for_tree(tree);
+        tree.volume_serial(conn).await
     }
 
     /// Stat multiple files on the given share.
@@ -1152,6 +1205,19 @@ impl SmbClient {
     /// No DFS retry; the reader pins to the connection it was built from.
     pub async fn open_file_reader(&self, tree: &Tree, path: &str) -> Result<stream::FileReader> {
         stream::open_file_reader(std::sync::Arc::new(tree.clone()), self.conn.clone(), path).await
+    }
+
+    /// Open a random-access reader through an exact token from a listing.
+    ///
+    /// Unlike the String convenience method, this also routes a resolved DFS
+    /// tree through the connection that owns it.
+    pub async fn open_file_reader_token(
+        &mut self,
+        tree: &Tree,
+        token: &tree::SmbPathToken,
+    ) -> Result<stream::FileReader> {
+        let conn = self.connection_for_tree(tree).clone();
+        stream::open_file_reader_token(std::sync::Arc::new(tree.clone()), conn, token).await
     }
 
     /// Create a push-based pipelined streaming file writer.
