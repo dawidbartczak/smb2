@@ -96,7 +96,7 @@ impl SmbOperationError {
         connection_generation: u64,
     ) -> Self {
         Self {
-            command,
+            command: error.command().unwrap_or(command),
             phase,
             nt_status: error.status(),
             kind: error.kind(),
@@ -369,6 +369,14 @@ impl Error {
     pub fn status(&self) -> Option<NtStatus> {
         match self {
             Error::Protocol { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// Returns the command carried by a typed protocol/send failure.
+    pub fn command(&self) -> Option<Command> {
+        match self {
+            Error::Protocol { command, .. } | Error::SendTimeout { command, .. } => Some(*command),
             _ => None,
         }
     }
@@ -789,5 +797,17 @@ mod tests {
         assert!(diagnostic.retryable);
         assert_eq!(diagnostic.session_id, SessionId(17));
         assert_eq!(diagnostic.connection_generation, 3);
+
+        let actual_command_wins = SmbOperationError::capture(
+            &Error::Protocol {
+                status: NtStatus::INSUFFICIENT_RESOURCES,
+                command: Command::Close,
+            },
+            Command::Read,
+            SmbOperationPhase::Read,
+            SessionId(17),
+            3,
+        );
+        assert_eq!(actual_command_wins.command, Command::Close);
     }
 }
