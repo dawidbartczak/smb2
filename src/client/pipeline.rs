@@ -333,8 +333,9 @@ mod tests {
         buf.extend_from_slice(&(name_bytes_len as u32).to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes()); // EaSize
         buf.push(0); // ShortNameLength
-        buf.push(0); // Reserved
+        buf.push(0); // Reserved1
         buf.extend_from_slice(&[0u8; 24]); // ShortName
+        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved2
         buf.extend_from_slice(&0xfeed_u64.to_le_bytes()); // FileId
         for &u in &name_u16 {
             buf.extend_from_slice(&u.to_le_bytes());

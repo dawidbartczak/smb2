@@ -3984,8 +3984,9 @@ fn parse_reparse_target(
 /// - FileNameLength (4 bytes)
 /// - EaSize (4 bytes)
 /// - ShortNameLength (1 byte)
-/// - Reserved (1 byte)
+/// - Reserved1 (1 byte)
 /// - ShortName (24 bytes)
+/// - Reserved2 (2 bytes)
 /// - FileId (8 bytes)
 /// - FileName (variable, FileNameLength bytes)
 fn parse_file_id_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
@@ -4013,9 +4014,14 @@ fn parse_file_id_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>>
         let file_name_length = cursor.read_u32_le()? as usize;
         let _ea_size = cursor.read_u32_le()?;
         let _short_name_length = cursor.read_u8()?;
-        let _reserved = cursor.read_u8()?;
+        let _reserved1 = cursor.read_u8()?;
         // ShortName: 24 bytes (fixed, null-padded).
         cursor.skip(24)?;
+        // Reserved2 aligns the following 64-bit FileId at offset 96. Skipping
+        // it is essential: otherwise the FileId and every filename are read
+        // two bytes early, turning (for example) `..` into a fabricated
+        // control-character path that the server can never reopen.
+        cursor.skip(2)?;
         let stable_id = cursor.read_u64_le()?;
         // Preserve the literal code units for every later CREATE. The decoded
         // display name is deliberately separate from the lossless archive
@@ -4215,6 +4221,8 @@ mod tests {
         buf.push(0);
         // ShortName (24 bytes, zero-padded)
         buf.extend_from_slice(&[0u8; 24]);
+        // Reserved2 (2 bytes)
+        buf.extend_from_slice(&0u16.to_le_bytes());
         // FileId (8)
         buf.extend_from_slice(&stable_id.to_le_bytes());
         // FileName (variable)
@@ -4541,6 +4549,28 @@ mod tests {
         assert!(unpaired.archive_name.starts_with('\u{F0000}'));
     }
 
+    #[test]
+    fn file_id_alignment_cannot_fabricate_a_control_character_dot_entry() {
+        // The high FileId word was formerly consumed as the first UTF-16 name
+        // unit because Reserved2 was not skipped. This exact shape produced
+        // the observed false `U+0005 + "."` entry from a real `..` record.
+        let data = build_file_both_dir_info_units(
+            &[u16::from(b'.'), u16::from(b'.')],
+            0,
+            FILE_ATTRIBUTE_DIRECTORY,
+            0,
+            0x0005_0000_0000_0001,
+        );
+        let entry = parse_file_id_both_directory_info(&data).unwrap().remove(0);
+
+        assert_eq!(entry.archive_name, "..");
+        assert_eq!(
+            entry.reopen_token.units(),
+            &[u16::from(b'.'), u16::from(b'.')]
+        );
+        assert_eq!(entry.stable_id, Some(0x0005_0000_0000_0001));
+    }
+
     #[tokio::test]
     async fn listed_control_character_reopens_with_the_literal_wire_token() {
         let mock = Arc::new(MockTransport::new());
@@ -4731,9 +4761,23 @@ mod tests {
     #[tokio::test]
     async fn parse_file_both_dir_info_single_entry() {
         let data = build_file_both_dir_info("test.txt", 42, false, 0);
+        // MS-FSCC 2.4.22 fixes FileId at byte 96 and FileName at byte 104.
+        // Keep this offset assertion independent of the parser: a former test
+        // fixture omitted Reserved2 in exactly the same way as production and
+        // therefore hid a two-byte filename shift.
+        assert_eq!(&data[94..96], &[0, 0]);
+        assert_eq!(
+            u64::from_le_bytes(data[96..104].try_into().unwrap()),
+            0xfeed_0000_0000_0001
+        );
+        assert_eq!(
+            u16::from_le_bytes(data[104..106].try_into().unwrap()),
+            't' as u16
+        );
         let entries = parse_file_id_both_directory_info(&data).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "test.txt");
+        assert_eq!(entries[0].stable_id, Some(0xfeed_0000_0000_0001));
         assert_eq!(entries[0].size, 42);
         assert!(!entries[0].is_directory);
         assert_eq!(entries[0].change_time, FileTime(133_000_000_000_000_000));
