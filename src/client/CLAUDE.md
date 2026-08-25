@@ -152,9 +152,11 @@ Table, rationale, and the empirical evidence: `src/name.rs` module docs. What ma
   `Tree::volume_serial`; zero or unscoped IDs are unavailable, never stable.
 - Entries with `FILE_ATTRIBUTE_REPARSE_POINT` are classified by
   `reparse_descriptor_token` (`FSCTL_GET_REPARSE_POINT`) before use. Symlinks
-  and junctions expose their actual print-name target, non-directory
-  file-like tags remain readable files, and unknown directory tags remain a
-  typed unresolved condition rather than an empty link.
+  and junctions expose their actual print-name target, including WSL/DrvFs
+  `LX_SYMLINK` UTF-8 payloads. Legacy V1 LX links are read once through the
+  reparse point's bounded data stream. Non-directory file-like tags remain
+  readable files, and unknown directory tags remain a typed unresolved
+  condition rather than an empty link.
 - **Write compound**: CREATE + WRITE + FLUSH + CLOSE (4 ops, 1 round-trip). Default for `write_file`.
 - **Delete compound**: CREATE (DELETE_ON_CLOSE) + CLOSE (2 ops, 1 round-trip). Default for `delete_file` / `delete_directory`.
 - **Rename compound**: CREATE + SET_INFO + CLOSE (3 ops, 1 round-trip). Default for `rename`.

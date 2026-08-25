@@ -124,6 +124,9 @@ const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 /// Microsoft mount-point/junction reparse tag.
 const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 
+/// WSL/DrvFs Linux symbolic-link reparse tag.
+const IO_REPARSE_TAG_LX_SYMLINK: u32 = 0xA000_001D;
+
 /// Exact server path captured from a directory listing.
 ///
 /// The UTF-16 code units are intentionally opaque. Reopening through this
@@ -1680,7 +1683,119 @@ impl Tree {
             });
         }
         let response = IoctlResponse::unpack(&mut ReadCursor::new(&responses[1].body))?;
-        parse_reparse_descriptor(&response.output_data, is_directory)
+        let mut descriptor = parse_reparse_descriptor(&response.output_data, is_directory)?;
+        if descriptor.tag == IO_REPARSE_TAG_LX_SYMLINK && descriptor.target.is_none() {
+            if is_directory {
+                return Err(Error::invalid_data(
+                    "legacy LX symlink unexpectedly carries the directory attribute",
+                ));
+            }
+            descriptor.target = Some(self.read_legacy_lx_symlink_target(conn, token).await?);
+        }
+        Ok(descriptor)
+    }
+
+    /// DrvFs V1 stored only its version in the reparse payload and kept the
+    /// UTF-8 link target in the reparse point's ordinary data stream. Read
+    /// that bounded stream without following the link.
+    async fn read_legacy_lx_symlink_target(
+        &self,
+        conn: &Connection,
+        token: &SmbPathToken,
+    ) -> Result<String> {
+        let create_req = CreateRequest {
+            requested_oplock_level: OplockLevel::None,
+            impersonation_level: ImpersonationLevel::Impersonation,
+            desired_access: FileAccessMask::new(
+                FileAccessMask::FILE_READ_DATA
+                    | FileAccessMask::FILE_READ_ATTRIBUTES
+                    | FileAccessMask::SYNCHRONIZE,
+            ),
+            file_attributes: 0,
+            share_access: ShareAccess(
+                ShareAccess::FILE_SHARE_READ
+                    | ShareAccess::FILE_SHARE_WRITE
+                    | ShareAccess::FILE_SHARE_DELETE,
+            ),
+            create_disposition: CreateDisposition::FileOpen,
+            create_options: FILE_OPEN_REPARSE_POINT | FILE_NON_DIRECTORY_FILE,
+            name: String::new(),
+            create_contexts: vec![],
+        };
+        let create_req = RawCreateRequest::new(&create_req, token.units());
+        let read_req = ReadRequest {
+            padding: 0x50,
+            flags: 0,
+            length: MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
+            offset: 0,
+            file_id: FileId::SENTINEL,
+            minimum_count: 0,
+            channel: SMB2_CHANNEL_NONE,
+            remaining_bytes: 0,
+            read_channel_info: vec![],
+        };
+        let close_req = CloseRequest {
+            flags: 0,
+            file_id: FileId::SENTINEL,
+        };
+        let ops = [
+            CompoundOp {
+                command: Command::Create,
+                body: &create_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::Read,
+                body: &read_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+            CompoundOp {
+                command: Command::Close,
+                body: &close_req,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            },
+        ];
+        let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
+        if responses[0].header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: responses[0].header.status,
+                command: Command::Create,
+            });
+        }
+        let create = CreateResponse::unpack(&mut ReadCursor::new(&responses[0].body))?;
+        if create.end_of_file > u64::from(MAXIMUM_REPARSE_DATA_BUFFER_SIZE) {
+            return Err(Error::invalid_data(format!(
+                "legacy LX symlink target is too large: {} bytes",
+                create.end_of_file
+            )));
+        }
+        if responses[1].header.status != NtStatus::SUCCESS {
+            let mut cleanup = conn.clone();
+            let _ = self.close_handle(&mut cleanup, create.file_id).await;
+            return Err(Error::Protocol {
+                status: responses[1].header.status,
+                command: Command::Read,
+            });
+        }
+        if responses[2].header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: responses[2].header.status,
+                command: Command::Close,
+            });
+        }
+        let data = ReadResponse::unpack(&mut ReadCursor::new(&responses[1].body))?.data;
+        if data.len() as u64 != create.end_of_file {
+            return Err(Error::invalid_data(format!(
+                "legacy LX symlink target read {} of {} bytes",
+                data.len(),
+                create.end_of_file
+            )));
+        }
+        parse_lx_symlink_target_bytes(&data, "legacy LX symlink data stream")?
+            .ok_or_else(|| Error::invalid_data("legacy LX symlink target data stream is empty"))
     }
 
     /// Rename or move a file within the same share using a compound request (1 round-trip).
@@ -3903,15 +4018,40 @@ fn parse_reparse_descriptor(data: &[u8], is_directory: bool) -> Result<ReparseDe
     let target = match tag {
         IO_REPARSE_TAG_SYMLINK => parse_reparse_target(data, end, 20, 8, 10, 12, 14)?,
         IO_REPARSE_TAG_MOUNT_POINT => parse_reparse_target(data, end, 16, 8, 10, 12, 14)?,
+        IO_REPARSE_TAG_LX_SYMLINK => parse_lx_reparse_target(data, end)?,
         _ => None,
     };
     let kind = match tag {
-        IO_REPARSE_TAG_SYMLINK => ReparseKind::SymbolicLink,
+        IO_REPARSE_TAG_SYMLINK | IO_REPARSE_TAG_LX_SYMLINK => ReparseKind::SymbolicLink,
         IO_REPARSE_TAG_MOUNT_POINT => ReparseKind::Junction,
         _ if !is_directory => ReparseKind::FileLike,
         _ => ReparseKind::Unknown,
     };
     Ok(ReparseDescriptor { tag, kind, target })
+}
+
+fn parse_lx_reparse_target(data: &[u8], end: usize) -> Result<Option<String>> {
+    const LX_HEADER_END: usize = 12;
+    if end < LX_HEADER_END {
+        return Err(Error::invalid_data("LX symlink version field is truncated"));
+    }
+    let _version = u32::from_le_bytes(data[8..LX_HEADER_END].try_into().expect("four-byte slice"));
+    parse_lx_symlink_target_bytes(&data[LX_HEADER_END..end], "LX symlink reparse payload")
+}
+
+fn parse_lx_symlink_target_bytes(data: &[u8], context: &str) -> Result<Option<String>> {
+    let data = data.strip_suffix(&[0]).unwrap_or(data);
+    if data.is_empty() {
+        return Ok(None);
+    }
+    if data.contains(&0) {
+        return Err(Error::invalid_data(format!(
+            "{context} contains an embedded NUL"
+        )));
+    }
+    std::str::from_utf8(data)
+        .map(|target| Some(target.to_owned()))
+        .map_err(|_| Error::invalid_data(format!("{context} contains invalid UTF-8")))
 }
 
 fn parse_reparse_target(
@@ -4258,6 +4398,19 @@ mod tests {
 
         let mut out = Vec::new();
         out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    fn build_lx_symlink_reparse_buffer(target: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(4 + target.len());
+        payload.extend_from_slice(&2u32.to_le_bytes());
+        payload.extend_from_slice(target);
+
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&0xA000_001Du32.to_le_bytes());
         out.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&payload);
@@ -4698,6 +4851,39 @@ mod tests {
             parse_reparse_descriptor(&unknown, true).unwrap().kind,
             ReparseKind::Unknown
         );
+    }
+
+    #[test]
+    fn lx_symlink_reparse_payload_is_not_treated_as_regular_file_data() {
+        let modern = build_lx_symlink_reparse_buffer(b"../lib/aarch64-linux-gnu/ld.so");
+        assert_eq!(
+            parse_reparse_descriptor(&modern, false).unwrap(),
+            ReparseDescriptor {
+                tag: 0xA000_001D,
+                kind: ReparseKind::SymbolicLink,
+                target: Some("../lib/aarch64-linux-gnu/ld.so".to_string()),
+            }
+        );
+
+        let legacy = build_lx_symlink_reparse_buffer(b"");
+        assert_eq!(
+            parse_reparse_descriptor(&legacy, false).unwrap(),
+            ReparseDescriptor {
+                tag: 0xA000_001D,
+                kind: ReparseKind::SymbolicLink,
+                target: None,
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_lx_symlink_targets_are_rejected() {
+        let mut truncated = build_lx_symlink_reparse_buffer(b"target");
+        truncated.truncate(11);
+        assert!(parse_reparse_descriptor(&truncated, false).is_err());
+
+        let invalid_utf8 = build_lx_symlink_reparse_buffer(&[0xFF, 0xFE]);
+        assert!(parse_reparse_descriptor(&invalid_utf8, false).is_err());
     }
 
     #[test]
