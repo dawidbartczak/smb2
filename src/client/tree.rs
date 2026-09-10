@@ -281,7 +281,7 @@ pub struct FileFingerprint {
 }
 
 impl FileFingerprint {
-    fn from_create(response: &CreateResponse) -> Self {
+    pub(crate) fn from_create(response: &CreateResponse) -> Self {
         Self {
             size: response.end_of_file,
             modified: response.last_write_time,
@@ -2848,8 +2848,24 @@ impl Tree {
         conn: &Connection,
         token: &SmbPathToken,
     ) -> Result<(FileId, FileFingerprint)> {
+        let resp = self
+            .open_file_with_lease_context_token(conn, token, None)
+            .await?;
+        Ok((resp.file_id, FileFingerprint::from_create(&resp)))
+    }
+
+    pub(crate) async fn open_file_with_lease_context_token(
+        &self,
+        conn: &Connection,
+        token: &SmbPathToken,
+        lease: Option<&super::read_lease::ReadLeaseRegistration>,
+    ) -> Result<CreateResponse> {
         let req = CreateRequest {
-            requested_oplock_level: OplockLevel::None,
+            requested_oplock_level: if lease.is_some() {
+                OplockLevel::Lease
+            } else {
+                OplockLevel::None
+            },
             impersonation_level: ImpersonationLevel::Impersonation,
             desired_access: FileAccessMask::new(
                 FileAccessMask::FILE_READ_DATA
@@ -2863,9 +2879,9 @@ impl Tree {
                     | ShareAccess::FILE_SHARE_DELETE,
             ),
             create_disposition: CreateDisposition::FileOpen,
-            create_options: 0,
+            create_options: 0x40, // FILE_NON_DIRECTORY_FILE
             name: String::new(),
-            create_contexts: vec![],
+            create_contexts: lease.map(|l| l.context()).unwrap_or_default(),
         };
         let req = RawCreateRequest::new(&req, token.units());
 
@@ -2882,7 +2898,7 @@ impl Tree {
 
         let mut cursor = ReadCursor::new(&frame.body);
         let resp = CreateResponse::unpack(&mut cursor)?;
-        Ok((resp.file_id, FileFingerprint::from_create(&resp)))
+        Ok(resp)
     }
 
     /// Open (or create) a file for writing, returning the file handle.

@@ -1308,7 +1308,7 @@ impl Inner {
         charge: u16,
         command: Command,
     ) -> Result<CreditReservation<'_>> {
-        let class = if command == Command::Close {
+        let class = if matches!(command, Command::Close | Command::OplockBreak) {
             CreditClass::Control
         } else {
             CreditClass::Data
@@ -2343,7 +2343,7 @@ impl Connection {
         // together (MS-SMB2 § 3.2.4.1.6 consumes `CreditCharge` sequence
         // numbers per request), and a reservation that has to wait must not
         // leave a hole in the sequence window meanwhile.
-        let class = if command == Command::Close {
+        let class = if matches!(command, Command::Close | Command::OplockBreak) {
             CreditClass::Control
         } else {
             CreditClass::Data
@@ -4326,6 +4326,14 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
             .unsolicited_notifications_received
             .fetch_add(1, Ordering::Relaxed);
         if header.command == Command::OplockBreak {
+            if sub.get(Header::SIZE..Header::SIZE + 2) == Some(&44u16.to_le_bytes()) {
+                let server = inner.params.lock().unwrap().as_ref().map(|p| p.server_guid);
+                super::read_lease::receive_break(&sub[Header::SIZE..], server)?;
+                return Ok(SubFrameAction::Skip);
+            }
+            if sub.get(Header::SIZE..Header::SIZE + 2) != Some(&24u16.to_le_bytes()) {
+                return Err(Error::invalid_data("unrecognized oplock/lease break shape"));
+            }
             // Only a handle this crate opened durably ever holds an oplock, so
             // a break we can place is one of ours; anything else (a lease
             // break, whose body has a different shape entirely) is not ours to
@@ -4461,6 +4469,8 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
 /// never "inserted but already drained" (which would leave the caller
 /// hanging on `rx.await`).
 fn fan_error_to_waiters(inner: &Inner, e: &Error) {
+    let server = inner.params.lock().unwrap().as_ref().map(|p| p.server_guid);
+    super::read_lease::invalidate_server(server);
     let drained: Vec<(MessageId, Waiter)> = {
         let mut waiters = inner.waiters.lock().unwrap();
         inner.disconnected.store(true, Ordering::Release);

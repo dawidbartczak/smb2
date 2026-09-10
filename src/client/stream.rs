@@ -345,6 +345,7 @@ impl Drop for FileDownload<'_> {
 /// # }
 /// ```
 pub struct FileReader {
+    lease: Option<super::read_lease::ReadLeaseRegistration>,
     tree: Arc<Tree>,
     conn: Connection,
     file_id: FileId,
@@ -393,7 +394,105 @@ pub async fn open_file_reader_token(
     ))
 }
 
+/// Open with a read-only caching lease. Unsupported servers use a normal
+/// reader; no write or handle caching is requested. Keep the returned reader
+/// alive to retain continuity, and close it to invalidate all its receipts.
+pub async fn open_file_reader_leased_token(
+    tree: Arc<Tree>,
+    conn: Connection,
+    token: &SmbPathToken,
+) -> Result<FileReader> {
+    use crate::types::{flags::Capabilities, Dialect};
+    if !conn.params().is_some_and(|p| {
+        p.dialect != Dialect::Smb2_0_2 && p.capabilities.contains(Capabilities::LEASING)
+    }) {
+        return open_file_reader_token(tree, conn, token).await;
+    }
+    let registration = super::read_lease::ReadLeaseRegistration::new(&conn, tree.tree_id);
+    let response = match tree
+        .open_file_with_lease_context_token(&conn, token, Some(&registration))
+        .await
+    {
+        Ok(response) => response,
+        Err(Error::Protocol {
+            status,
+            command: Command::Create,
+        }) if status == NtStatus::NOT_SUPPORTED || status == NtStatus::INVALID_PARAMETER => {
+            drop(registration);
+            return open_file_reader_token(tree, conn, token).await;
+        }
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = registration.grant(response.oplock_level, &response.create_contexts) {
+        let mut cleanup = conn.clone();
+        let _ = tree.close_handle(&mut cleanup, response.file_id).await;
+        return Err(error);
+    }
+    let fingerprint = FileFingerprint::from_create(&response);
+    let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
+    let mut reader = FileReader::new(tree, conn, response.file_id, fingerprint, max_read);
+    reader.lease = Some(registration);
+    Ok(reader)
+}
+
 impl FileReader {
+    /// Query the identity of the actual open, without trusting a listing.
+    /// Unsupported identity queries return None and cannot authorize reuse.
+    pub async fn source_object_id(&self) -> Result<Option<super::tree::SourceObjectId>> {
+        use crate::msg::query_info::{InfoType, QueryInfoRequest, QueryInfoResponse};
+        let mut values = Vec::new();
+        for (info_type, class, length) in [(InfoType::File, 6, 8), (InfoType::Filesystem, 1, 128)] {
+            let request = QueryInfoRequest {
+                info_type,
+                file_info_class: class,
+                output_buffer_length: length,
+                additional_information: 0,
+                flags: 0,
+                file_id: self.file_id,
+                input_buffer: vec![],
+            };
+            let frame = self
+                .conn
+                .execute(Command::QueryInfo, &request, Some(self.tree.tree_id))
+                .await?;
+            if frame.header.status != NtStatus::SUCCESS {
+                return Ok(None);
+            }
+            values
+                .push(QueryInfoResponse::unpack(&mut ReadCursor::new(&frame.body))?.output_buffer);
+        }
+        if values[0].len() < 8 || values[1].len() < 12 {
+            return Ok(None);
+        }
+        Ok(super::tree::SourceObjectId::new(
+            u32::from_le_bytes(values[1][8..12].try_into().unwrap()),
+            u64::from_le_bytes(values[0][..8].try_into().unwrap()),
+        ))
+    }
+
+    /// Validate namespace binding through a fresh open while retaining the
+    /// original protected handle. The temporary open never supplies content.
+    pub async fn validate_read_lease_token(
+        &self,
+        token: &SmbPathToken,
+        expected: super::tree::SourceObjectId,
+    ) -> Result<bool> {
+        let Some(proof) = self.read_lease_proof() else {
+            return Ok(false);
+        };
+        let reader = open_file_reader_token(self.tree.clone(), self.conn.clone(), token).await?;
+        let identity = reader.source_object_id().await;
+        let close = reader.close().await;
+        let matches = identity? == Some(expected);
+        close?;
+        Ok(matches && proof.is_valid())
+    }
+
+    /// Receipt for the read lease while this exact open remains alive.
+    pub fn read_lease_proof(&self) -> Option<super::read_lease::ReadLeaseProof> {
+        self.lease.as_ref().and_then(|lease| lease.proof())
+    }
+
     /// Wrap an already-opened read handle. Most callers want
     /// [`open_file_reader`], [`Tree::open_file_reader`], or
     /// [`SmbClient::open_file_reader`](crate::SmbClient::open_file_reader),
@@ -410,6 +509,7 @@ impl FileReader {
             conn,
             file_id,
             file_size: opened_fingerprint.size,
+            lease: None,
             opened_fingerprint,
             max_read,
             closed: false,
@@ -504,6 +604,7 @@ impl FileReader {
     /// every reader; a dropped-without-close reader leaks the handle (see the
     /// type-level note).
     pub async fn close(mut self) -> Result<()> {
+        self.lease.take();
         self.closed = true;
         self.tree.close_handle(&mut self.conn, self.file_id).await
     }
@@ -513,6 +614,7 @@ impl FileReader {
     /// Consumes `self` like [`close`](Self::close). A CLOSE transport or
     /// protocol error is returned after a best-effort plain CLOSE cleanup.
     pub async fn close_with_fingerprint(mut self) -> Result<FileFingerprint> {
+        self.lease.take();
         self.closed = true;
         self.tree
             .close_handle_with_fingerprint(&mut self.conn, self.file_id)
@@ -531,6 +633,7 @@ impl FileReader {
         mut self,
         deadlines: CloseDeadlines,
     ) -> Result<FileFingerprint> {
+        self.lease.take();
         self.closed = true;
         self.tree
             .close_handle_with_fingerprint_bounded(

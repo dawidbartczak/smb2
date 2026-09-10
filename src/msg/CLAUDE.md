@@ -58,3 +58,5 @@ Built by `Connection::send_compound`. Each sub-request's header has a `NextComma
 Parse entry points are exposed via the `fuzzing` feature (`smb2::fuzzing`) and exercised by the `fuzz/` crate. See
 `fuzz/README.md` (if present) or run `just fuzz fuzz_header_parse 300` for a local sweep. Every new parser touching
 external bytes should get a fuzz target wrapper added in `src/fuzzing.rs` and a matching `fuzz/fuzz_targets/*.rs`.
+
+Read-only RqLs context handling lives in `client/read_lease.rs` and uses the shared create-context codec. Lease Break Notification (44 bytes) is distinct from the legacy 24-byte OplockBreak; ACK is 36 bytes and relinquishes all caching.

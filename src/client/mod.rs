@@ -14,6 +14,7 @@ pub mod durable;
 #[cfg(test)]
 mod fault_injection_tests;
 pub mod pipeline;
+pub mod read_lease;
 pub mod session;
 pub mod shares;
 pub mod stream;
