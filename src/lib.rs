@@ -89,8 +89,8 @@ pub use client::copy::{
 
 // Tree and file types
 pub use client::tree::{
-    CompoundRead, DirectoryEntry, FileFingerprint, FileInfo, FsInfo, ListingTrace, QueryStep,
-    ReparseDescriptor, ReparseKind, SmbPathToken, SourceObjectId, Tree,
+    CompoundRead, DirectoryEntry, DirectoryReader, FileFingerprint, FileInfo, FsInfo, ListingTrace,
+    QueryStep, ReparseDescriptor, ReparseKind, SmbPathToken, SourceObjectId, Tree,
 };
 
 // Pipeline

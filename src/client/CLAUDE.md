@@ -346,3 +346,31 @@ Full design in [docs/specs/connection-actor.md](../../docs/specs/connection-acto
 `read_lease.rs` registers RqLs READ-only leases before CREATE and never resurrects a broken registration on a late grant. All connections share ClientGuid, so break lookup is process-wide and scoped to ServerGuid; transport loss conservatively invalidates that server's receipts. The receiver invalidates before scheduling ACK on the owning connection/tree. OplockBreak acknowledgements, like CLOSE, use Control credits. No write caching or durable lease reclamation is implemented.
 
 `open_file_reader_leased_token` falls back to normal reads when leasing is unsupported. `FileReader::source_object_id` queries the actual open; `validate_read_lease_token` checks a fresh namespace open against the held object and rechecks the receipt. Persisted receipt tokens have no independent authority. Closing/dropping the owner invalidates its cloned receipts.
+
+## Paged directory reader
+
+`Tree::open_directory_reader[_token]` returns an owned `DirectoryReader`.
+It retains one CREATE handle across pages and delegates to the same
+`query_directory_step` parser and connection credit gate as full listings.
+Only the initial page uses RESTART_SCANS; FileIndex remains zero. Tokens are
+bound to the parent without a display-name round trip. EOF closes and checks
+CLOSE, failure preserves its primary cause, and early stop must call `close`.
+A successful empty page is not interpreted as EOF. No pagination state survives
+reconnect, and callers must restart a failed directory as a whole.
+
+Protocol references: MS-SMB2 2.2.33 and 3.3.5.18, including
+https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/10906442-294c-46d3-8515-c277efe1f752
+and https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/29dfcc9b-3aec-406b-abb5-0b4fe96712e2 .
+
+
+The paged API is also exposed by `SmbClient`; its existing DFS resolver selects
+and retains the actual tree/connection. `DirectoryReader::set_close_deadlines`
+bounds cleanup after EOF, failure, or cancellation of a borrowed `next_page`
+future. Dropping that future leaves cursor ownership with the caller, which must
+then CLOSE. It does not impose a total retry deadline. `SmbPathToken` opaque
+bytes round-trip exact UTF-16 solely for authenticated, share-bound runtime
+scratch; these bytes are not user path authorization.
+
+`MetricsSnapshot::credit_wait_micros` sums real parked reservation time,
+including dropped futures. Parallel waits overlap; this is worker time, not
+wall-clock duration. Fast reservations do not add wait time.

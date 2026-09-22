@@ -1345,6 +1345,18 @@ impl Inner {
         );
 
         let started = std::time::Instant::now();
+        // Drop also measures cancellation while parked, without retaining any
+        // request payload or changing the credit reservation lifecycle.
+        struct CreditWait<'a>(&'a AtomicU64, std::time::Instant);
+        impl Drop for CreditWait<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(
+                    self.1.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        let _elapsed = CreditWait(&self.metrics.credit_wait_micros, started);
         let deadline = started + timeout.unwrap_or_else(|| self.credits.wait_timeout());
         let mut reserving = Box::pin(self.credits.reserve(charge, class));
         loop {
@@ -1650,6 +1662,8 @@ pub(crate) struct Metrics {
     /// was in flight. A steady trickle is normal on a saturated pipeline; a
     /// flood means the server's window is too small for the chunk size.
     pub credit_waits: AtomicU64,
+    /// Sum of parked credit-reservation time, including aborted waits.
+    pub credit_wait_micros: AtomicU64,
     /// Sends that gave up waiting for a grant. Non-zero means a server went
     /// silent while its socket stayed open.
     pub credit_starvations: AtomicU64,
@@ -1721,6 +1735,7 @@ impl Metrics {
             malformed_frames: self.malformed_frames.load(Relaxed),
             session_expired_events: self.session_expired_events.load(Relaxed),
             credit_waits: self.credit_waits.load(Relaxed),
+            credit_wait_micros: self.credit_wait_micros.load(Relaxed),
             credit_starvations: self.credit_starvations.load(Relaxed),
             response_timeouts: self.response_timeouts.load(Relaxed),
             send_failures: self.send_failures.load(Relaxed),
@@ -5236,6 +5251,7 @@ mod tests {
             "the grant on the first response must release the parked send"
         );
         assert_eq!(conn.metrics().credit_waits, 1);
+        assert!(conn.metrics().credit_wait_micros >= 50_000);
     }
 
     #[tokio::test]

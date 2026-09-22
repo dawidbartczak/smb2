@@ -4,6 +4,9 @@
 //! It provides methods for directory listing, file reading/writing, deletion,
 //! renaming, stat, and directory creation.
 
+mod directory_cursor;
+pub use directory_cursor::DirectoryReader;
+
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -148,6 +151,32 @@ impl std::fmt::Debug for SmbPathToken {
 }
 
 impl SmbPathToken {
+    /// Serialize an exact listed path for an authenticated, private runtime
+    /// cache. This is an opaque token, never a display/archive filename.
+    #[must_use]
+    pub fn opaque_bytes(&self) -> Vec<u8> {
+        self.wire_path
+            .iter()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect()
+    }
+
+    /// Restore only bytes from a trusted/authenticated cache in the same share
+    /// context. Callers must not accept user supplied tokens as path authority.
+    pub fn from_opaque_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() % 2 != 0 || bytes.len() > u16::MAX as usize {
+            return Err(crate::Error::invalid_data("invalid opaque SMB path length"));
+        }
+        let wire_path: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        if wire_path.contains(&0) {
+            return Err(crate::Error::invalid_data("NUL in opaque SMB path"));
+        }
+        Ok(Self { wire_path })
+    }
+
     fn from_wire_path(wire_path: Vec<u16>) -> Self {
         Self { wire_path }
     }
@@ -3825,6 +3854,33 @@ impl Tree {
             });
         }
 
+        Ok(())
+    }
+
+    async fn close_directory_bounded(
+        &self,
+        conn: &mut Connection,
+        file_id: FileId,
+        deadlines: crate::CloseDeadlines,
+    ) -> Result<()> {
+        conn.forget_oplock(file_id);
+        let request = CloseRequest { flags: 0, file_id };
+        let frame = conn
+            .execute_with_deadlines(
+                Command::Close,
+                &request,
+                Some(self.tree_id),
+                CreditCharge(1),
+                deadlines.credit_wait,
+                deadlines.response_wait,
+            )
+            .await?;
+        if frame.header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: frame.header.status,
+                command: Command::Close,
+            });
+        }
         Ok(())
     }
 
@@ -8345,5 +8401,145 @@ mod tests {
         handle_b.await.expect("task b panicked");
 
         assert_eq!(mock.sent_count(), 6); // 2 CREATE + 2 READ + 2 CLOSE
+    }
+    fn paged_test_tree() -> Tree {
+        Tree {
+            tree_id: TreeId(10),
+            share_name: "test".into(),
+            server: "test-server".into(),
+            is_dfs: false,
+            encrypt_data: false,
+        }
+    }
+    #[tokio::test]
+    async fn directory_cursor_pages_empty_continuation_and_exact_tokens() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_create_response(
+            FileId {
+                persistent: 1,
+                volatile: 2,
+            },
+            0,
+        ));
+        for (status, payload) in [
+            (
+                NtStatus::SUCCESS,
+                build_file_both_dir_info("a.txt", 1, false, 0),
+            ),
+            (NtStatus::SUCCESS, vec![]),
+            (
+                NtStatus::SUCCESS,
+                build_file_both_dir_info("b.txt", 2, false, 0),
+            ),
+            (NtStatus::NO_MORE_FILES, vec![]),
+        ] {
+            mock.queue_response(build_query_directory_response(status, payload));
+        }
+        mock.queue_response(build_close_response());
+        let mut conn = setup_connection(&mock);
+        let mut reader = paged_test_tree()
+            .open_directory_reader(&mut conn, "parent")
+            .await
+            .unwrap();
+        let first = reader.next_page().await.unwrap().unwrap();
+        assert_eq!(
+            first[0].reopen_token.units(),
+            "parent\\a.txt".encode_utf16().collect::<Vec<_>>()
+        );
+        assert!(reader.next_page().await.unwrap().unwrap().is_empty());
+        assert_eq!(
+            reader.next_page().await.unwrap().unwrap()[0].archive_name,
+            "b.txt"
+        );
+        assert!(reader.next_page().await.unwrap().is_none());
+        assert!(reader.next_page().await.unwrap().is_none());
+        assert_eq!(mock.sent_count(), 6);
+        for n in 1..=4 {
+            let frame = mock.sent_message(n).unwrap();
+            let mut input = ReadCursor::new(&frame);
+            assert_eq!(
+                Header::unpack(&mut input).unwrap().command,
+                Command::QueryDirectory
+            );
+            let request = QueryDirectoryRequest::unpack(&mut input).unwrap();
+            assert_eq!(
+                request.flags.0 & QueryDirectoryFlags::RESTART_SCANS != 0,
+                n == 1
+            );
+            assert_eq!(request.file_index, 0);
+        }
+    }
+    #[tokio::test]
+    async fn directory_cursor_error_closes_and_preserves_primary_status() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_create_response(
+            FileId {
+                persistent: 1,
+                volatile: 2,
+            },
+            0,
+        ));
+        mock.queue_response(build_query_directory_response(
+            NtStatus::ACCESS_DENIED,
+            vec![],
+        ));
+        mock.queue_response(build_close_response());
+        let mut conn = setup_connection(&mock);
+        let mut reader = paged_test_tree()
+            .open_directory_reader(&mut conn, "parent")
+            .await
+            .unwrap();
+        assert!(matches!(
+            reader.next_page().await,
+            Err(Error::Protocol {
+                status: NtStatus::ACCESS_DENIED,
+                ..
+            })
+        ));
+        assert!(reader.next_page().await.unwrap().is_none());
+        assert_eq!(mock.sent_count(), 3);
+    }
+    #[tokio::test]
+    async fn directory_cursor_cancelled_query_retains_cursor_for_bounded_close() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_create_response(
+            FileId {
+                persistent: 1,
+                volatile: 2,
+            },
+            0,
+        ));
+        let mut conn = setup_connection(&mock);
+        let mut reader = paged_test_tree()
+            .open_directory_reader(&mut conn, "parent")
+            .await
+            .unwrap();
+        reader.set_close_deadlines(crate::CloseDeadlines {
+            credit_wait: Duration::from_millis(30),
+            response_wait: Duration::from_millis(30),
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), reader.next_page())
+                .await
+                .is_err()
+        );
+        // Drain the cancelled request's late reply before CLOSE's reply.
+        mock.queue_response(build_query_directory_response(
+            NtStatus::NO_MORE_FILES,
+            vec![],
+        ));
+        mock.queue_response(build_close_response());
+        reader.close().await.unwrap();
+        assert_eq!(mock.sent_count(), 3);
+    }
+    #[test]
+    fn opaque_token_roundtrip_preserves_utf16_without_filename_mapping() {
+        let token = SmbPathToken::from_wire_path(vec![b'p' as u16, 0x5c, 0xd800, 0xf03a, 0xfffd]);
+        assert_eq!(
+            SmbPathToken::from_opaque_bytes(&token.opaque_bytes()).unwrap(),
+            token
+        );
+        assert!(SmbPathToken::from_opaque_bytes(&[1]).is_err());
+        assert!(SmbPathToken::from_opaque_bytes(&[0, 0]).is_err());
     }
 }

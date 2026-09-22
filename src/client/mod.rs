@@ -39,8 +39,8 @@ pub use session::Session;
 pub use shares::list_shares;
 pub use stream::{CloseDeadlines, FileDownload, FileUpload, FileWriter, Progress};
 pub use tree::{
-    CompoundRead, DirectoryEntry, FileFingerprint, FileInfo, FsInfo, ListingTrace, QueryStep,
-    ReparseDescriptor, ReparseKind, SmbPathToken, SourceObjectId, Tree,
+    CompoundRead, DirectoryEntry, DirectoryReader, FileFingerprint, FileInfo, FsInfo, ListingTrace,
+    QueryStep, ReparseDescriptor, ReparseKind, SmbPathToken, SourceObjectId, Tree,
 };
 pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 
@@ -711,6 +711,41 @@ impl SmbClient {
             }
             other => other,
         }
+    }
+
+    /// Open bounded pages, resolving DFS and recovering a lost session before
+    /// the cursor is established. Once open, its connection/tree stay pinned.
+    pub async fn open_directory_reader(
+        &mut self,
+        tree: &mut Tree,
+        path: &str,
+    ) -> Result<DirectoryReader> {
+        let result = tree
+            .open_directory_reader(self.connection_for_tree(tree), path)
+            .await;
+        match result {
+            Err(e) if self.should_retry_dfs(&e) => {
+                let path = self.handle_dfs_redirect(tree, path).await?;
+                tree.open_directory_reader(self.connection_for_tree(tree), &path)
+                    .await
+            }
+            Err(e) if self.session_is_gone(&e) => {
+                self.recover_tree(tree).await?;
+                tree.open_directory_reader(self.connection_for_tree(tree), path)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    /// Open bounded pages using an already resolved exact path token.
+    pub async fn open_directory_reader_token(
+        &mut self,
+        tree: &Tree,
+        token: &tree::SmbPathToken,
+    ) -> Result<DirectoryReader> {
+        tree.open_directory_reader_token(self.connection_for_tree(tree), token)
+            .await
     }
 
     /// List a directory through the exact token captured from its parent.

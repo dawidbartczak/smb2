@@ -393,6 +393,8 @@ pub struct MetricsSnapshot {
     /// flood means the server's window is small relative to the chunk size,
     /// and throughput is bounded by credits rather than by the network.
     pub credit_waits: u64,
+    /// Summed credit-reservation wait time; parallel waits overlap.
+    pub credit_wait_micros: u64,
     /// Sends that gave up waiting for a grant and returned
     /// [`Error::CreditStarvation`](crate::Error::CreditStarvation). Subset of
     /// [`Self::credit_waits`]; don't sum. Non-zero means a server stopped
