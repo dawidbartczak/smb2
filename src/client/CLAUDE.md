@@ -378,6 +378,15 @@ wall-clock duration. Fast reservations do not add wait time.
 
 ### Signature-work observations
 
+`MetricsSnapshot::read_requests_dispatched` counts READ sub-requests when the
+writer begins their transport send, after credit admission and queue wait.
+Every READ in a compound counts, including encrypted frames whose wire bytes
+no longer expose command headers. ECHO/CLOSE/CANCEL do not count. Failed sends
+still count as attempts; this is not server-receipt confirmation. It separates
+pause-time read admission from later handle cleanup. A gated transport regression
+holds a prior ECHO, checks zero while standalone/compound READs are queued, then
+checks all three READs on dispatch under plaintext and encrypted transport.
+
 `MetricsSnapshot::signature_verify_bytes` and `signature_verify_micros` count
 synchronous receive-side verification work, including failed signatures.
 AEAD-authenticated encrypted frames do not enter this stage. Time includes

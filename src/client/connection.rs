@@ -293,6 +293,7 @@ const ABANDONED_ID_MEMORY: usize = 512;
 /// One frame waiting for the socket.
 struct WriteJob {
     bytes: Vec<u8>,
+    read_requests: u64,
     /// For the log line and the [`Error::SendTimeout`]; the first sub-op's
     /// command for a compound.
     command: Command,
@@ -332,6 +333,14 @@ async fn writer_loop(
         let deadline = *strong.send_timeout.lock().unwrap();
         let len = job.bytes.len();
         let started = std::time::Instant::now();
+
+        // Count at writer dispatch, after queueing and credit admission. A
+        // transport error may still prevent delivery, so this is an attempted
+        // send count, not a claim that the server received the READs.
+        strong
+            .metrics
+            .read_requests_dispatched
+            .fetch_add(job.read_requests, Ordering::Relaxed);
 
         let result = match deadline {
             Some(d) => match tokio::time::timeout(d, sender.send(&job.bytes)).await {
@@ -1226,10 +1235,21 @@ impl Inner {
     /// frame — keeps `wire_bytes_sent` from drifting as new send sites
     /// are added.
     async fn send_and_count(&self, bytes: &[u8], command: Command) -> Result<()> {
+        self.send_and_count_reads(bytes, command, u64::from(command == Command::Read))
+            .await
+    }
+
+    async fn send_and_count_reads(
+        &self,
+        bytes: &[u8],
+        command: Command,
+        read_requests: u64,
+    ) -> Result<()> {
         let len = bytes.len();
         let (done_tx, done_rx) = oneshot::channel();
         let job = WriteJob {
             bytes: bytes.to_vec(),
+            read_requests,
             command,
             queued_at: std::time::Instant::now(),
             done: done_tx,
@@ -1637,6 +1657,7 @@ impl Inner {
 pub(crate) struct Metrics {
     // Send path
     pub requests_sent: AtomicU64,
+    pub read_requests_dispatched: AtomicU64,
     pub compound_requests_sent: AtomicU64,
     pub wire_bytes_sent: AtomicU64,
     pub explicit_cancels_sent: AtomicU64,
@@ -1719,6 +1740,7 @@ impl Metrics {
         use std::sync::atomic::Ordering::Relaxed;
         crate::client::diagnostics::MetricsSnapshot {
             requests_sent: self.requests_sent.load(Relaxed),
+            read_requests_dispatched: self.read_requests_dispatched.load(Relaxed),
             compound_requests_sent: self.compound_requests_sent.load(Relaxed),
             wire_bytes_sent: self.wire_bytes_sent.load(Relaxed),
             explicit_cancels_sent: self.explicit_cancels_sent.load(Relaxed),
@@ -2843,14 +2865,19 @@ impl Connection {
             compound_buf.extend_from_slice(sub_req);
         }
 
+        let read_requests = ops.iter().filter(|op| op.command == Command::Read).count() as u64;
         let send_result = if should_encrypt {
             match self.encrypt_bytes(&compound_buf) {
-                Ok(enc) => self.inner.send_and_count(&enc, ops[0].command).await,
+                Ok(enc) => {
+                    self.inner
+                        .send_and_count_reads(&enc, ops[0].command, read_requests)
+                        .await
+                }
                 Err(e) => return Err(e),
             }
         } else {
             self.inner
-                .send_and_count(&compound_buf, ops[0].command)
+                .send_and_count_reads(&compound_buf, ops[0].command, read_requests)
                 .await
         };
         send_result?;
@@ -5262,6 +5289,109 @@ mod tests {
         inner: Arc<MockTransport>,
         delay: Duration,
         seen: std::sync::atomic::AtomicUsize,
+    }
+
+    #[tokio::test]
+    async fn read_dispatch_counter_excludes_queue_wait_and_counts_compound_reads() {
+        struct GatedSend {
+            mock: Arc<MockTransport>,
+            release: Arc<tokio::sync::Notify>,
+            first: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait::async_trait]
+        impl TransportSend for GatedSend {
+            async fn send(&self, bytes: &[u8]) -> Result<()> {
+                if self.first.swap(false, Ordering::SeqCst) {
+                    self.release.notified().await;
+                }
+                self.mock.send(bytes).await
+            }
+        }
+        for encrypted in [false, true] {
+            let mock = Arc::new(MockTransport::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let mut conn = Connection::from_transport(
+                Box::new(GatedSend {
+                    mock: mock.clone(),
+                    release: release.clone(),
+                    first: std::sync::atomic::AtomicBool::new(true),
+                }),
+                Box::new(mock.clone()),
+                "test",
+            );
+            conn.set_credits(512);
+            if encrypted {
+                conn.activate_encryption(vec![0x42; 16], vec![0x42; 16], Cipher::Aes128Gcm);
+            }
+            let echo = {
+                let c = conn.clone();
+                tokio::spawn(async move {
+                    c.execute(Command::Echo, &crate::msg::echo::EchoRequest, None)
+                        .await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while conn.send_queue_depth() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let read = crate::msg::read::ReadRequest {
+                padding: 0,
+                flags: 0,
+                length: 4096,
+                offset: 0,
+                file_id: crate::types::FileId {
+                    persistent: 1,
+                    volatile: 2,
+                },
+                minimum_count: 0,
+                channel: 0,
+                remaining_bytes: 0,
+                read_channel_info: vec![],
+            };
+            let single = {
+                let c = conn.clone();
+                let read = read.clone();
+                tokio::spawn(async move { c.execute(Command::Read, &read, None).await })
+            };
+            let compound = {
+                let c = conn.clone();
+                tokio::spawn(async move {
+                    c.execute_compound(&[
+                        CompoundOp::new(Command::Echo, &crate::msg::echo::EchoRequest, None),
+                        CompoundOp::new(Command::Read, &read, None),
+                        CompoundOp::new(Command::Read, &read, None),
+                    ])
+                    .await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while conn.send_queue_depth() != 3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(conn.metrics().read_requests_dispatched, 0);
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while mock.sent_count() != 3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(conn.metrics().read_requests_dispatched, 3);
+            echo.abort();
+            single.abort();
+            compound.abort();
+            let _ = echo.await;
+            let _ = single.await;
+            let _ = compound.await;
+            mock.close();
+        }
     }
 
     #[async_trait::async_trait]

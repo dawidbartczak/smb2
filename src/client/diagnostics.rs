@@ -310,6 +310,11 @@ pub struct MetricsSnapshot {
     /// every `execute_compound`. Does *not* include CANCEL (see
     /// [`Self::explicit_cancels_sent`]).
     pub requests_sent: u64,
+    /// READ sub-requests whose frame reached writer dispatch, after credit
+    /// admission and queue wait. Includes every READ in a compound, including
+    /// encrypted compounds. Counts attempted transport sends (even on failure),
+    /// not confirmed server receipt. Other commands do not advance this counter.
+    pub read_requests_dispatched: u64,
     /// Every successful `execute_compound` call — the chain itself, not
     /// the per-sub-op count (those tick `requests_sent`).
     pub compound_requests_sent: u64,
