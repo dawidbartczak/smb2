@@ -559,7 +559,7 @@ fn spawn_plumbing(
         old.abort();
     }
 
-    let inner_for_task = Arc::clone(inner);
+    let inner_for_task = Arc::downgrade(inner);
     let handle = tokio::spawn(async move {
         receiver_loop(receiver, inner_for_task).await;
     });
@@ -1875,7 +1875,7 @@ impl Connection {
         // Update preauth hash with request bytes.
         self.inner.preauth_hasher.lock().unwrap().update(&req_bytes);
 
-        let mut guard = self.register_waiter(msg_id, Command::Negotiate)?;
+        let guard = self.register_waiter(msg_id, Command::Negotiate)?;
 
         let rtt_start = std::time::Instant::now();
         self.inner
@@ -1884,7 +1884,7 @@ impl Connection {
         reservation.commit();
         self.inner.mark_sent(&[msg_id]);
 
-        let frame = guard.recv().await?;
+        let frame = self.await_response(guard, Command::Negotiate).await?;
         *self.inner.estimated_rtt.lock().unwrap() = Some(rtt_start.elapsed());
 
         // Preauth hash update with response bytes.
@@ -4039,9 +4039,16 @@ impl Connection {
 
 /// Receiver task loop: owns the transport receive half, routes each frame
 /// to its waiter.
-async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, inner: Arc<Inner>) {
+async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, weak: Weak<Inner>) {
     loop {
-        let raw = match transport_recv.receive().await {
+        // Do not retain Inner while waiting for the next frame: Inner owns
+        // this task's handle and aborts it when the last owner disappears.
+        // A strong reference here would keep abandoned sockets alive forever.
+        let received = transport_recv.receive().await;
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        let raw = match received {
             Ok(bytes) => bytes,
             Err(e) => {
                 debug!("receiver_loop: transport error: {}, shutting down", e);
@@ -4718,6 +4725,41 @@ mod tests {
     use crate::msg::negotiate::{NegotiateContext, HASH_ALGORITHM_SHA512};
     use crate::transport::MockTransport;
     use crate::types::flags::HeaderFlags;
+
+    #[tokio::test]
+    async fn connection_lifecycle_last_idle_clone_releases_inner() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(Box::new(mock.clone()), Box::new(mock), "test");
+        let remaining = conn.clone();
+        let weak = Arc::downgrade(&conn.inner);
+        tokio::task::yield_now().await;
+        drop(conn);
+        assert!(
+            weak.upgrade().is_some(),
+            "a live clone must retain the connection"
+        );
+        drop(remaining);
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the receiver must not retain its own connection forever");
+    }
+
+    #[tokio::test]
+    async fn connection_lifecycle_negotiate_obeys_response_deadline() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(Box::new(mock.clone()), Box::new(mock), "test");
+        conn.set_keepalive(None);
+        conn.set_response_timeout(Some(Duration::from_millis(20)));
+        let result = tokio::time::timeout(Duration::from_millis(500), conn.negotiate())
+            .await
+            .expect("NEGOTIATE must use the connection response deadline");
+        assert!(matches!(result, Err(Error::Timeout)));
+        assert!(conn.outstanding_requests().is_empty());
+    }
 
     /// Pack a set of SMB2 sub-responses into one compound transport frame
     /// by wiring up `NextCommand` offsets and 8-byte-padding each sub
