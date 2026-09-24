@@ -375,3 +375,12 @@ scratch; these bytes are not user path authorization.
 `MetricsSnapshot::credit_wait_micros` sums real parked reservation time,
 including dropped futures. Parallel waits overlap; this is worker time, not
 wall-clock duration. Fast reservations do not add wait time.
+
+### Signature-work observations
+
+`MetricsSnapshot::signature_verify_bytes` and `signature_verify_micros` count
+synchronous receive-side verification work, including failed signatures.
+AEAD-authenticated encrypted frames do not enter this stage. Time includes
+preemption and is wall work, not thread CPU, network latency or application
+payload throughput. Counters retain connection lifetime semantics and add no
+per-frame logging or changes to authentication/routing behavior.

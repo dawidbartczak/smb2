@@ -358,6 +358,12 @@ pub struct MetricsSnapshot {
     /// routed to the matching waiter (also ticks
     /// [`Self::responses_routed_err`]); the connection continues.
     pub signature_failures: u64,
+    /// Signed sub-frame bytes submitted to signature verification, including
+    /// failures. Excludes encrypted frames whose integrity is provided by AEAD.
+    pub signature_verify_bytes: u64,
+    /// Cumulative synchronous verification wall time, including failures and
+    /// any process preemption. This is not thread CPU time or network latency.
+    pub signature_verify_micros: u64,
     /// Frames the receiver task could not decrypt (auth-tag mismatch,
     /// missing decryption key, malformed `TransformHeader`). Counted
     /// once before the connection tears down — the receiver task

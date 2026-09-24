@@ -1652,6 +1652,8 @@ pub(crate) struct Metrics {
     pub status_pending_loops: AtomicU64,
     pub unsolicited_notifications_received: AtomicU64,
     pub signature_failures: AtomicU64,
+    pub signature_verify_bytes: AtomicU64,
+    pub signature_verify_micros: AtomicU64,
     pub decrypt_failures: AtomicU64,
     pub decompress_failures: AtomicU64,
     pub malformed_frames: AtomicU64,
@@ -1730,6 +1732,8 @@ impl Metrics {
                 .unsolicited_notifications_received
                 .load(Relaxed),
             signature_failures: self.signature_failures.load(Relaxed),
+            signature_verify_bytes: self.signature_verify_bytes.load(Relaxed),
+            signature_verify_micros: self.signature_verify_micros.load(Relaxed),
             decrypt_failures: self.decrypt_failures.load(Relaxed),
             decompress_failures: self.decompress_failures.load(Relaxed),
             malformed_frames: self.malformed_frames.load(Relaxed),
@@ -4432,9 +4436,18 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
             // one frame that says the cancel did not take.
             let is_cancel = header.command == Command::Cancel;
             if let (Some(key), Some(algo)) = (signing_key, signing_algorithm) {
-                if let Err(e) =
-                    signing::verify_signature(sub, &key, algo, header.message_id.0, is_cancel)
-                {
+                let started = std::time::Instant::now();
+                let verified =
+                    signing::verify_signature(sub, &key, algo, header.message_id.0, is_cancel);
+                inner.metrics.signature_verify_micros.fetch_add(
+                    started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+                inner
+                    .metrics
+                    .signature_verify_bytes
+                    .fetch_add(sub.len() as u64, Ordering::Relaxed);
+                if let Err(e) = verified {
                     inner
                         .metrics
                         .signature_failures
@@ -6129,6 +6142,60 @@ mod tests {
             "the cancel bit has to be part of the check, got {action:?}"
         );
         assert_eq!(conn.metrics().signature_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn signature_work_metrics_include_failures_and_exclude_aead_frames() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn =
+            Connection::from_transport(Box::new(mock.clone()), Box::new(mock), "test-server");
+        let key = vec![0xAB; 16];
+        conn.activate_signing(key.clone(), SigningAlgorithm::AesCmac);
+        let _guard = conn.register_waiter(MessageId(9), Command::Read).unwrap();
+        let mut h = Header::new_request(Command::Read);
+        h.flags.set_response();
+        h.flags.set_signed();
+        h.message_id = MessageId(9);
+        h.status = NtStatus::INVALID_PARAMETER;
+        let body = crate::msg::header::ErrorResponse {
+            error_context_count: 0,
+            error_data: vec![0x31; 65_536],
+        };
+        let mut frame = pack_message(&h, &body);
+        signing::sign_message_as_server(&mut frame, &key, SigningAlgorithm::AesCmac, 9, false)
+            .unwrap();
+        assert!(matches!(
+            prepare_sub_frame(&frame, false, &conn.inner).unwrap(),
+            SubFrameAction::Route(_, Ok(_))
+        ));
+        let first = conn.metrics();
+        assert_eq!(first.signature_verify_bytes, frame.len() as u64);
+        assert!(first.signature_verify_micros > 0);
+        assert_eq!(first.signature_failures, 0);
+        *frame.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            prepare_sub_frame(&frame, false, &conn.inner).unwrap(),
+            SubFrameAction::Route(_, Err(_))
+        ));
+        let failed = conn.metrics();
+        assert_eq!(failed.signature_verify_bytes, 2 * frame.len() as u64);
+        assert!(failed.signature_verify_micros >= first.signature_verify_micros);
+        assert_eq!(failed.signature_failures, 1);
+        // AEAD has already authenticated the frame: the existing receiver
+        // contract skips SMB signature work without touching these counters.
+        assert!(matches!(
+            prepare_sub_frame(&frame, true, &conn.inner).unwrap(),
+            SubFrameAction::Route(_, Ok(_))
+        ));
+        let encrypted = conn.metrics();
+        assert_eq!(
+            encrypted.signature_verify_bytes,
+            failed.signature_verify_bytes
+        );
+        assert_eq!(
+            encrypted.signature_verify_micros,
+            failed.signature_verify_micros
+        );
     }
 
     // ── Encryption tests ─────────────────────────────────────────────
