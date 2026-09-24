@@ -898,8 +898,8 @@ pub struct NegotiatedParams {
 ///   inspect the original wire bytes.
 ///
 /// Callers receive one `Frame` per matched `MessageId`. Frames are owned;
-/// the receiver task allocates fresh `Vec`s for `body` / `raw` as it splits
-/// compound frames, so you can store or mutate them freely.
+/// the receiver task transfers its owned wire buffer into `raw` and copies
+/// `body`, so you can store or mutate them independently.
 #[derive(Debug)]
 pub struct Frame {
     /// Parsed SMB2 header of this sub-response.
@@ -4194,7 +4194,7 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, weak: Weak<Inn
         };
 
         // Split by NextCommand.
-        let sub_frames = match split_compound(&decoded) {
+        let sub_frames = match split_compound_owned(decoded) {
             Ok(subs) => subs,
             Err(e) => {
                 inner
@@ -4224,7 +4224,7 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, weak: Weak<Inn
         // rather than hanging forever.
         let mut routable: Vec<(MessageId, Result<Frame>)> = Vec::new();
         for sub in sub_frames {
-            match prepare_sub_frame(&sub, was_encrypted, &inner) {
+            match prepare_sub_frame(sub, was_encrypted, &inner) {
                 Ok(SubFrameAction::Route(msg_id, result)) => routable.push((msg_id, result)),
                 Ok(SubFrameAction::Skip) => { /* notification / STATUS_PENDING */ }
                 Ok(SubFrameAction::AckOplockBreak(brk, tree_id)) => {
@@ -4364,12 +4364,16 @@ pub(crate) enum SubFrameAction {
 /// unrecoverable errors where the connection is now out of sync
 /// (header parse failure on a sub-frame the compound-splitter claimed was
 /// valid — the receiver loop fans the error to all waiters and exits).
-fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<SubFrameAction> {
+fn prepare_sub_frame(
+    mut sub: Vec<u8>,
+    was_encrypted: bool,
+    inner: &Inner,
+) -> Result<SubFrameAction> {
     // Parse the header. A failure here means split_compound produced a
     // chunk that doesn't start with a valid SMB2 header — the framing is
     // corrupt and we can't know where the next sub-frame begins. Fatal
     // to the connection.
-    let mut cursor = ReadCursor::new(sub);
+    let mut cursor = ReadCursor::new(&sub);
     let header = match Header::unpack(&mut cursor) {
         Ok(h) => h,
         Err(e) => {
@@ -4482,8 +4486,13 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
             let is_cancel = header.command == Command::Cancel;
             if let (Some(key), Some(algo)) = (signing_key, signing_algorithm) {
                 let started = std::time::Instant::now();
-                let verified =
-                    signing::verify_signature(sub, &key, algo, header.message_id.0, is_cancel);
+                let verified = signing::verify_signature_in_place(
+                    &mut sub,
+                    &key,
+                    algo,
+                    header.message_id.0,
+                    is_cancel,
+                );
                 inner.metrics.signature_verify_micros.fetch_add(
                     started.elapsed().as_micros().min(u64::MAX as u128) as u64,
                     Ordering::Relaxed,
@@ -4532,7 +4541,7 @@ fn prepare_sub_frame(sub: &[u8], was_encrypted: bool, inner: &Inner) -> Result<S
     } else {
         Vec::new()
     };
-    let raw = sub.to_vec();
+    let raw = sub;
     let msg_id = header.message_id;
     Ok(SubFrameAction::Route(
         msg_id,
@@ -4652,6 +4661,17 @@ pub(crate) fn split_compound(data: &[u8]) -> Result<Vec<Vec<u8>>> {
         offset += next_cmd as usize;
     }
     Ok(results)
+}
+
+/// Retain the transport allocation for a standalone response (the bulk READ
+/// path). Compound responses use the same validated splitter and retain all
+/// padding bytes, which are covered by each sub-frame's signature.
+fn split_compound_owned(data: Vec<u8>) -> Result<Vec<Vec<u8>>> {
+    if data.len() >= Header::SIZE && data[20..24] == [0; 4] {
+        Ok(vec![data])
+    } else {
+        split_compound(&data)
+    }
 }
 
 /// Await a per-request `oneshot::Receiver` and translate the three
@@ -4783,6 +4803,89 @@ mod tests {
     use crate::msg::negotiate::{NegotiateContext, HASH_ALGORITHM_SHA512};
     use crate::transport::MockTransport;
     use crate::types::flags::HeaderFlags;
+
+    #[tokio::test]
+    async fn owned_response_keeps_signed_wire_buffer_and_compound_padding() {
+        for algorithm in [
+            SigningAlgorithm::HmacSha256,
+            SigningAlgorithm::AesCmac,
+            SigningAlgorithm::AesGmac,
+        ] {
+            let mock = Arc::new(MockTransport::new());
+            let mut conn =
+                Connection::from_transport(Box::new(mock.clone()), Box::new(mock), "test");
+            let key = vec![0x35; 16];
+            conn.activate_signing(key.clone(), algorithm);
+            for compound in [false, true] {
+                let count = if compound { 2 } else { 1 };
+                let mut wire = Vec::new();
+                let mut expected = Vec::new();
+                for id in 1..=count {
+                    let mut header = Header::new_request(Command::Echo);
+                    header.flags.set_response();
+                    header.flags.set_signed();
+                    header.message_id = MessageId(id);
+                    let mut sub = pack_message(&header, &crate::msg::echo::EchoResponse);
+                    if compound && id == 1 {
+                        sub.resize(80, 0xA9); // Padding belongs to the signed sub-frame.
+                        sub[20..24].copy_from_slice(&80u32.to_le_bytes());
+                    } else {
+                        sub.resize(4 * 1024 * 1024 + 80, 0x53);
+                    }
+                    signing::sign_message_as_server(&mut sub, &key, algorithm, id, false).unwrap();
+                    wire.extend_from_slice(&sub);
+                    expected.push(sub);
+                }
+                let original_ptr = wire.as_ptr();
+                let parts = split_compound_owned(wire).unwrap();
+                assert_eq!(parts, expected);
+                if !compound {
+                    assert_eq!(
+                        parts[0].as_ptr(),
+                        original_ptr,
+                        "standalone frame must retain its allocation"
+                    );
+                }
+                for (sub, expected) in parts.into_iter().zip(expected) {
+                    let sub_ptr = sub.as_ptr();
+                    let SubFrameAction::Route(_, Ok(frame)) =
+                        prepare_sub_frame(sub, false, &conn.inner).unwrap()
+                    else {
+                        panic!("signed response was not routed");
+                    };
+                    assert_eq!(
+                        frame.raw.as_ptr(),
+                        sub_ptr,
+                        "routing must retain the owned wire buffer"
+                    );
+                    assert_eq!(frame.raw, expected);
+                    assert_eq!(frame.body, expected[Header::SIZE..]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owned_compound_split_preserves_malformed_frame_rejection() {
+        for length in [0, 23, 63, 64, 65, 80, 128, 192] {
+            for next in [0u32, 1, 7, 8, 63, 64, 65, 80, 128, 192, u32::MAX] {
+                let mut wire = vec![0; length];
+                if length >= 24 {
+                    wire[20..24].copy_from_slice(&next.to_le_bytes());
+                }
+                let expected = split_compound(&wire);
+                let actual = split_compound_owned(wire);
+                assert_eq!(
+                    actual.is_ok(),
+                    expected.is_ok(),
+                    "length={length}, next={next}"
+                );
+                if let (Ok(actual), Ok(expected)) = (actual, expected) {
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn receive_prefetch_overlaps_dispatch_but_holds_only_one_extra_frame() {
@@ -5983,7 +6086,7 @@ mod tests {
         h.status = NtStatus::PENDING;
         h.async_id = Some(0xFEED_FACE_DEAD_BEEF);
         let interim = pack_message(&h, &crate::msg::echo::EchoResponse);
-        let action = prepare_sub_frame(&interim, false, &conn.inner)
+        let action = prepare_sub_frame(interim, false, &conn.inner)
             .expect("the interim response should be handled");
         assert!(
             matches!(action, SubFrameAction::Skip),
@@ -6252,7 +6355,7 @@ mod tests {
         let mut good = pack_message(&h, &body);
         signing::sign_message_as_server(&mut good, &key, SigningAlgorithm::AesGmac, 9, true)
             .unwrap();
-        let action = prepare_sub_frame(&good, false, &conn.inner).unwrap();
+        let action = prepare_sub_frame(good, false, &conn.inner).unwrap();
         assert!(
             matches!(action, SubFrameAction::Route(_, Ok(_))),
             "a correctly signed CANCEL response must verify, got {action:?}"
@@ -6264,7 +6367,7 @@ mod tests {
         let mut wrong = pack_message(&h, &body);
         signing::sign_message_as_server(&mut wrong, &key, SigningAlgorithm::AesGmac, 9, false)
             .unwrap();
-        let action = prepare_sub_frame(&wrong, false, &conn.inner).unwrap();
+        let action = prepare_sub_frame(wrong, false, &conn.inner).unwrap();
         assert!(
             matches!(action, SubFrameAction::Route(_, Err(_))),
             "the cancel bit has to be part of the check, got {action:?}"
@@ -6293,7 +6396,7 @@ mod tests {
         signing::sign_message_as_server(&mut frame, &key, SigningAlgorithm::AesCmac, 9, false)
             .unwrap();
         assert!(matches!(
-            prepare_sub_frame(&frame, false, &conn.inner).unwrap(),
+            prepare_sub_frame(frame.clone(), false, &conn.inner).unwrap(),
             SubFrameAction::Route(_, Ok(_))
         ));
         let first = conn.metrics();
@@ -6302,7 +6405,7 @@ mod tests {
         assert_eq!(first.signature_failures, 0);
         *frame.last_mut().unwrap() ^= 1;
         assert!(matches!(
-            prepare_sub_frame(&frame, false, &conn.inner).unwrap(),
+            prepare_sub_frame(frame.clone(), false, &conn.inner).unwrap(),
             SubFrameAction::Route(_, Err(_))
         ));
         let failed = conn.metrics();
@@ -6312,7 +6415,7 @@ mod tests {
         // AEAD has already authenticated the frame: the existing receiver
         // contract skips SMB signature work without touching these counters.
         assert!(matches!(
-            prepare_sub_frame(&frame, true, &conn.inner).unwrap(),
+            prepare_sub_frame(frame.clone(), true, &conn.inner).unwrap(),
             SubFrameAction::Route(_, Ok(_))
         ));
         let encrypted = conn.metrics();

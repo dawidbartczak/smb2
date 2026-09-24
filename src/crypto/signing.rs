@@ -137,6 +137,19 @@ pub fn verify_signature(
     message_id: u64,
     is_cancel: bool,
 ) -> Result<(), Error> {
+    verify_signature_in_place(&mut message.to_vec(), key, algorithm, message_id, is_cancel)
+}
+
+/// Verify an exclusively owned receive buffer without copying its payload.
+/// The original signature is restored before returning, including on errors,
+/// so preauth hashing and callers still see the exact received wire bytes.
+pub(crate) fn verify_signature_in_place(
+    message: &mut [u8],
+    key: &[u8],
+    algorithm: SigningAlgorithm,
+    message_id: u64,
+    is_cancel: bool,
+) -> Result<(), Error> {
     if message.len() < MIN_MESSAGE_LEN {
         return Err(Error::invalid_data(format!(
             "message too short for verification: {} bytes, need at least {}",
@@ -149,14 +162,17 @@ pub fn verify_signature(
     let mut received_sig = [0u8; SIGNATURE_LEN];
     received_sig.copy_from_slice(&message[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_LEN]);
 
-    // Step 2: zero the signature field in a copy.
-    let mut buf = message.to_vec();
-    buf[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_LEN].fill(0);
+    // Step 2: zero only the signature field in the exclusively borrowed buffer.
+    message[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_LEN].fill(0);
 
     // Step 3: compute the expected signature.
     // is_response = true: the server signed this message, so the GMAC
     // nonce must have role bit = 1 (server).
-    let expected_sig = compute_signature(&buf, key, algorithm, message_id, is_cancel, true)?;
+    let expected_sig = compute_signature(message, key, algorithm, message_id, is_cancel, true);
+    // Restore even when the algorithm rejects the key. No error propagation
+    // may leave a caller's original wire bytes changed.
+    message[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_LEN].copy_from_slice(&received_sig);
+    let expected_sig = expected_sig?;
 
     // Step 4: compare.
     if received_sig != expected_sig {
@@ -389,6 +405,53 @@ mod tests {
     }
 
     // ── Message too short ─────────────────────────────────────────────
+
+    #[test]
+    fn owned_verification_restores_wire_bytes_on_every_result() {
+        for algorithm in [
+            SigningAlgorithm::HmacSha256,
+            SigningAlgorithm::AesCmac,
+            SigningAlgorithm::AesGmac,
+        ] {
+            for size in [64, 65, 80, 4097, 4 * 1024 * 1024 + 80] {
+                for is_cancel in [false, true] {
+                    let key = [0x39; 16];
+                    let mut message = vec![0xA7; size];
+                    sign_message_as_server(&mut message, &key, algorithm, 517, is_cancel).unwrap();
+                    for case in 0..4 {
+                        let mut wire = message.clone();
+                        let verify_key: &[u8] = match case {
+                            1 => &[0x38; 16],
+                            2 => &[0x39; 7],
+                            _ => &key,
+                        };
+                        if case == 3 {
+                            wire[32] ^= 1;
+                        }
+                        let original = wire.clone();
+                        let expected =
+                            verify_signature(&original, verify_key, algorithm, 517, is_cancel);
+                        let actual = verify_signature_in_place(
+                            &mut wire, verify_key, algorithm, 517, is_cancel,
+                        );
+                        assert_eq!(actual.is_ok(), expected.is_ok());
+                        assert_eq!(actual.is_ok(), case == 0);
+                        assert_eq!(wire, original, "wire bytes changed: {algorithm:?}/{case}");
+                    }
+                }
+            }
+        }
+        let mut short = vec![0x7D; 63];
+        assert!(verify_signature_in_place(
+            &mut short,
+            &[0; 16],
+            SigningAlgorithm::AesGmac,
+            0,
+            false,
+        )
+        .is_err());
+        assert_eq!(short, vec![0x7D; 63]);
+    }
 
     #[test]
     fn sign_rejects_message_shorter_than_64_bytes() {

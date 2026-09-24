@@ -388,6 +388,16 @@ per-frame logging or changes to authentication/routing behavior.
 
 ### Bounded raw-frame prefetch
 
+Standalone responses retain the transport's owned `Vec` through splitting,
+signature verification, and `Frame.raw`. Only `Frame.body` is copied to preserve
+the public API's independent mutable buffers. Compound responses keep the same
+splitter and signed padding. Verification temporarily zeros the signature in
+the exclusively borrowed buffer and restores it on success and error; callers
+and preauth hashing therefore still receive the original signed wire bytes.
+No crypto state, authentication policy, or dispatch ordering moves. Tests cover
+all three signing algorithms, compound padding, retained allocations, malformed
+framing, and byte-for-byte restoration after rejected signatures/keys.
+
 A single socket-reader task reserves a capacity-one queue slot **before** calling
 `TransportReceive::receive`. Thus central preparation can overlap receipt of the
 next frame, with at most one additional raw frame (TCP's existing 16 MiB limit).
