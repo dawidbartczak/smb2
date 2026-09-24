@@ -4043,12 +4043,65 @@ impl Connection {
 
 /// Receiver task loop: owns the transport receive half, routes each frame
 /// to its waiter.
+/// Abort the socket reader on every dispatcher exit, including task abortion
+/// during last-owner drop or reconnect. Dropping a JoinHandle alone detaches it.
+struct ReceiveTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ReceiveTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn receive_frames(
+    transport_recv: Box<dyn TransportReceive>,
+    weak: Weak<Inner>,
+    frames: mpsc::Sender<Result<Vec<u8>>>,
+) {
+    // Reserve BEFORE receiving: a full queue must prevent even allocating the
+    // next transport frame. TCP bounds each raw frame to 16 MiB. Together with
+    // the dispatcher's current frame there is only one extra raw frame, never
+    // a hidden third frame parked in send(). Neither await retains Inner.
+    while let Ok(permit) = frames.reserve().await {
+        let received = transport_recv.receive().await;
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        if let Ok(raw) = &received {
+            inner
+                .metrics
+                .wire_bytes_received
+                .fetch_add(raw.len() as u64, Ordering::Relaxed);
+            // Observe physical reception, not delayed dispatch. This is only
+            // liveness; authentication and every protocol side effect remain
+            // on the ordered dispatcher below.
+            inner.note_server_spoke();
+        }
+        drop(inner);
+        let terminal = received.is_err();
+        permit.send(received);
+        if terminal {
+            return;
+        }
+    }
+}
+
 async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, weak: Weak<Inner>) {
+    let (frames_tx, mut frames_rx) = mpsc::channel(1);
+    let _reader = ReceiveTask(tokio::spawn(receive_frames(
+        transport_recv,
+        weak.clone(),
+        frames_tx,
+    )));
     loop {
         // Do not retain Inner while waiting for the next frame: Inner owns
         // this task's handle and aborts it when the last owner disappears.
         // A strong reference here would keep abandoned sockets alive forever.
-        let received = transport_recv.receive().await;
+        let received = frames_rx.recv().await.unwrap_or(Err(Error::Disconnected));
+        // Releasing the queue slot can wake the reader into this worker's
+        // non-stealable LIFO slot. Let it start the next receive before doing
+        // synchronous crypto here, or the two stages would still serialize.
+        tokio::task::yield_now().await;
         let Some(inner) = weak.upgrade() else {
             return;
         };
@@ -4075,14 +4128,6 @@ async fn receiver_loop(transport_recv: Box<dyn TransportReceive>, weak: Weak<Inn
                 return;
             }
         };
-        inner
-            .metrics
-            .wire_bytes_received
-            .fetch_add(raw.len() as u64, Ordering::Relaxed);
-        // The connection's liveness clock, fed before anything can reject the
-        // frame. Even a frame we go on to discard proves the server is
-        // processing requests, which is the only thing this clock claims.
-        inner.note_server_spoke();
         trace!("receiver_loop: received {} bytes", raw.len());
         trace!(
             "receiver_loop: tick, waiters={}",
@@ -4739,6 +4784,53 @@ mod tests {
     use crate::transport::MockTransport;
     use crate::types::flags::HeaderFlags;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn receive_prefetch_overlaps_dispatch_but_holds_only_one_extra_frame() {
+        let mock = Arc::new(MockTransport::new());
+        let conn =
+            Connection::from_transport(Box::new(mock.clone()), Box::new(mock.clone()), "test");
+        // Freeze central frame preparation without freezing the transport or
+        // relying on how quickly this machine computes a particular MAC.
+        let inner = conn.inner.clone();
+        let (held_tx, held_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _guard = inner.crypto.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.await.unwrap();
+        for id in 1..=3 {
+            let mut header = Header::new_request(Command::Echo);
+            header.flags.set_response();
+            header.message_id = MessageId(id);
+            mock.queue_response(pack_message(&header, &crate::msg::echo::EchoResponse));
+        }
+        let overlapped = tokio::time::timeout(Duration::from_millis(500), async {
+            while mock.received_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let buffered = mock.received_count();
+        // Always release the blocked worker before assertions/runtime teardown.
+        release_tx.send(()).unwrap();
+        blocker.join().unwrap();
+        assert!(
+            overlapped.is_ok(),
+            "receive must overlap central preparation"
+        );
+        assert_eq!(buffered, 2, "one current frame plus one prefetched frame");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while conn.metrics().responses_stray != 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all prefetched frames must eventually reach central routing");
+    }
+
     #[tokio::test]
     async fn connection_lifecycle_last_idle_clone_releases_inner() {
         let mock = Arc::new(MockTransport::new());
@@ -4759,6 +4851,42 @@ mod tests {
         })
         .await
         .expect("the receiver must not retain its own connection forever");
+    }
+
+    #[tokio::test]
+    async fn receive_prefetch_last_owner_drop_closes_a_partial_tcp_frame() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let transport = Arc::new(
+            crate::transport::TcpTransport::connect(address, Duration::from_secs(1))
+                .await
+                .unwrap(),
+        );
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let conn = Connection::from_transport(
+            Box::new(transport.clone()),
+            Box::new(transport.clone()),
+            "test",
+        );
+        drop(transport);
+        // A complete length prefix but an incomplete body parks read_exact.
+        peer.write_all(&[0, 0, 0, 64, 0xfe, b'S', b'M', b'B'])
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        drop(conn);
+        let mut byte = [0];
+        let read = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+            .await
+            .expect("dropping the dispatcher must abort its socket reader");
+        // Closing with unread TCP bytes may produce RST instead of FIN; both
+        // prove that the reader did not outlive its final connection owner.
+        assert!(
+            matches!(read, Ok(0))
+                || matches!(read, Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+            "the peer must observe closure without sending a full frame: {read:?}"
+        );
     }
 
     #[tokio::test]

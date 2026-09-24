@@ -303,7 +303,7 @@ Full rationale in `durable.rs`'s module docs. `Tree::open_file_durable` asks for
 
 ## Connection internals: receiver task + `oneshot` routing
 
-`Connection::execute` / `execute_compound` is the primary API. A background receiver task (spawned per `Connection` at `from_transport`) owns the transport's read half and routes each sub-frame to a per-request `oneshot::Sender` by `MessageId`.
+`Connection::execute` / `execute_compound` is the primary API. A background dispatcher (spawned per `Connection` at `from_transport`) owns one socket-reader task and routes each sub-frame to a per-request `oneshot::Sender` by `MessageId`.
 
 - `Connection` is `Clone` and holds just `Arc<Inner>`. `Inner` owns `waiters: Mutex<HashMap<MessageId, Waiter>>`, `credits: CreditPool`, `next_message_id: AtomicU64`, the transport send half (via `Arc<dyn TransportSend>`), the receiver task's `JoinHandle`, and crypto state. All state is behind atomics or short-critical-section `std::sync::Mutex`.
 - `execute(command, body, tree_id)` allocates a `MessageId` (`AtomicU64::fetch_add(credit_charge)`), registers a `oneshot::Sender` in `waiters` atomically under the waiters lock (re-checks `disconnected` there to rule out a TOCTOU where the receiver task has already shut down and drained the map), packs the frame, signs/encrypts/compresses as needed, and writes through `TransportSend::send`. Then it awaits the local `oneshot::Receiver`. Returns `Result<Frame { header, body, raw }>`.
@@ -384,3 +384,29 @@ AEAD-authenticated encrypted frames do not enter this stage. Time includes
 preemption and is wall work, not thread CPU, network latency or application
 payload throughput. Counters retain connection lifetime semantics and add no
 per-frame logging or changes to authentication/routing behavior.
+
+
+### Bounded raw-frame prefetch
+
+A single socket-reader task reserves a capacity-one queue slot **before** calling
+`TransportReceive::receive`. Thus central preparation can overlap receipt of the
+next frame, with at most one additional raw frame (TCP's existing 16 MiB limit).
+There is no extra frame hidden in a blocked send. The dispatcher yields after
+freeing the slot so Tokio's worker-local LIFO wakeup cannot serialize the reader
+behind synchronous signature computation. On a single-thread runtime this still
+preserves behavior; CPU work remains synchronous and ordered.
+
+Only physical byte/liveness observations move to the socket reader. Decrypt,
+decompress, signature verification, credits, PENDING, lease/oplock processing,
+session expiry and response routing remain in their original serial order.
+No data reaches a caller before existing authentication checks. Crypto state is
+read at dispatch, not captured early. Transport errors follow already received
+frames. The dispatcher owns an abort-on-drop guard, so shutdown, reconnect,
+malformed frames and last-owner drop also close a reader waiting on a partial
+TCP frame. Neither stage retains Inner across channel/socket waits.
+
+The overlap/backpressure regression blocks central preparation and proves that
+exactly one following frame is received; a local TCP test proves last-owner drop
+closes the peer even with an incomplete frame. Protocol order was checked against
+MS-SMB2 3.2.5.1:
+https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/ceba89e3-5e49-489d-959a-7562a597c0d1
